@@ -73,6 +73,7 @@ import onboard
 import deviceinput
 import minicap
 import minitouch as mt
+import githubupdate
 import ollamaadmin
 import scrcpycontrol
 import scripting
@@ -973,6 +974,12 @@ class Agent:
                     selfupdate.schedule_restart()
             elif action == "self_rollback":
                 result = await selfupdate.rollback()
+                if result.get("ok"):
+                    selfupdate.schedule_restart()
+            elif action == "github_check_update":
+                result = githubupdate.check_latest()
+            elif action == "github_apply_update":
+                result = await githubupdate.apply_latest()
                 if result.get("ok"):
                     selfupdate.schedule_restart()
             # ---- local Ollama model management (agent-level) --------------------

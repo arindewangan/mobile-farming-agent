@@ -23,7 +23,9 @@ from pydantic import BaseModel
 import adminauth
 import bans as bans_mod
 import connections as connections_mod
+import githubupdate
 import netinfo
+import selfupdate
 import traffic
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adminstatic")
@@ -156,6 +158,22 @@ def create_app(
         if not await agent.kick_observer(connection_id):
             raise HTTPException(status_code=404, detail="no such observer connection")
         return {"ok": True}
+
+    # ---- self-update — checks GitHub Releases directly (no control-plane
+    # connection required); complements the push-from-backend path that
+    # still exists for boxes that only reach the control plane over LAN/
+    # Tailscale, never the open internet. ----------------------------------
+    @app.get("/api/update/check", dependencies=[Depends(require_session)])
+    async def update_check():
+        return githubupdate.check_latest()
+
+    @app.post("/api/update/apply", dependencies=[Depends(require_session)])
+    async def update_apply():
+        result = await githubupdate.apply_latest()
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error", "update failed"))
+        selfupdate.schedule_restart()
+        return result
 
     @app.get("/api/adb-devices", dependencies=[Depends(require_session)])
     async def adb_devices():

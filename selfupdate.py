@@ -149,29 +149,26 @@ async def _reinstall_deps() -> None:
         pass
 
 
-async def apply_update(bundle_b64: str, new_version: str) -> dict:
-    """Validates + stages the incoming bundle, backs the current install up,
-    swaps the new files in, best-effort reinstalls deps. Does NOT restart —
-    the caller sends this result over the websocket first, then calls
+async def install_from(source_dir: str, new_version: str) -> dict:
+    """Shared apply core: validates `source_dir` looks like a real agent
+    source tree, backs the current install up, swaps the new files in,
+    best-effort reinstalls deps, prunes old backups. Used by both
+    apply_update() (a bundle pushed over the websocket) and
+    githubupdate.apply_latest() (a tag downloaded from a GitHub release) —
+    from here on, it doesn't matter where the new source came from. Does NOT
+    restart — the caller sends this result back first, then calls
     schedule_restart()."""
-    try:
-        _extract_bundle(bundle_b64, STAGING_DIR)
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"bad update bundle: {e}"}
-
-    if not os.path.isfile(os.path.join(STAGING_DIR, "agent.py")):
-        shutil.rmtree(STAGING_DIR, ignore_errors=True)
-        return {"ok": False, "error": "update bundle is missing agent.py — refusing to apply"}
+    if not os.path.isfile(os.path.join(source_dir, "agent.py")):
+        return {"ok": False, "error": "update source is missing agent.py — refusing to apply"}
 
     old_version = current_version()
     try:
         backup_dir = _backup_current(f"{old_version}_{int(time.time())}")
     except Exception as e:  # noqa: BLE001
-        shutil.rmtree(STAGING_DIR, ignore_errors=True)
         return {"ok": False, "error": f"backup failed, update NOT applied: {e}"}
 
     try:
-        _apply_from(STAGING_DIR)
+        _apply_from(source_dir)
     except Exception as e:  # noqa: BLE001
         restored = False
         try:
@@ -184,12 +181,24 @@ async def apply_update(bundle_b64: str, new_version: str) -> dict:
         return {"ok": False, "error": f"apply failed AND restore also failed, "
                                        f"INSTALL_DIR is left broken and needs manual recovery: {e}",
                 "restored": False}
-    finally:
-        shutil.rmtree(STAGING_DIR, ignore_errors=True)
 
     await _reinstall_deps()
     _prune_old_backups()
     return {"ok": True, "from_version": old_version, "to_version": new_version, "restarting": True}
+
+
+async def apply_update(bundle_b64: str, new_version: str) -> dict:
+    """Validates + stages a bundle pushed over the websocket, then delegates
+    to install_from(). See that function's docstring for the actual apply
+    logic shared with the GitHub-pull path."""
+    try:
+        _extract_bundle(bundle_b64, STAGING_DIR)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"bad update bundle: {e}"}
+    try:
+        return await install_from(STAGING_DIR, new_version)
+    finally:
+        shutil.rmtree(STAGING_DIR, ignore_errors=True)
 
 
 def list_backups() -> list[str]:

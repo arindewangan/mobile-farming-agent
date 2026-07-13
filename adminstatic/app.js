@@ -54,7 +54,7 @@
     }
     loginScreen.style.display = "none";
     mainScreen.style.display = "flex";
-    await Promise.all([refreshStatus(), loadConnections(), loadBans(), loadDevices(), loadLog()]);
+    await Promise.all([refreshStatus(), loadConnections(), loadBans(), loadDevices(), loadLog(), loadUpdateInfo()]);
     if (statusTimer) clearInterval(statusTimer);
     statusTimer = setInterval(() => {
       refreshStatus();
@@ -186,6 +186,53 @@
       }
     });
   }
+
+  // -- software update (checks the agent's GitHub release directly) -------
+  async function loadUpdateInfo() {
+    const wrap = document.getElementById("update-wrap");
+    wrap.innerHTML = `<div class="subtle">Checking…</div>`;
+    let info;
+    try {
+      info = await api("/api/update/check");
+    } catch (e) {
+      wrap.innerHTML = `<div class="subtle">Couldn't check for updates: ${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    document.getElementById("update-current").textContent = info.current || "—";
+    if (!info.ok) {
+      wrap.innerHTML = `<div class="subtle">Couldn't check for updates: ${escapeHtml(info.error || "unknown error")}</div>`;
+      return;
+    }
+    if (!info.update_available) {
+      wrap.innerHTML = `<div class="subtle">Up to date.</div>`;
+      return;
+    }
+    wrap.innerHTML = `<div class="peer-card">
+      <div class="row between">
+        <div>
+          <b>Update available: v${escapeHtml(info.latest)}</b>
+          ${info.url ? ` <a href="${escapeHtml(info.url)}" target="_blank" rel="noopener">release notes</a>` : ""}
+        </div>
+        <button id="update-apply-btn">Update now</button>
+      </div>
+    </div>`;
+    document.getElementById("update-apply-btn").addEventListener("click", async () => {
+      if (!confirm(`Download and apply v${info.latest}? The agent restarts when done; the previous version is kept as a backup you can roll back to.`)) return;
+      const btn = document.getElementById("update-apply-btn");
+      btn.disabled = true;
+      btn.textContent = "Updating…";
+      try {
+        await api("/api/update/apply", { method: "POST" });
+        toast("Update applied — agent is restarting");
+        document.getElementById("update-wrap").innerHTML = `<div class="subtle">Restarting with v${escapeHtml(info.latest)}…</div>`;
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+        btn.textContent = "Update now";
+      }
+    });
+  }
+  document.getElementById("update-check-btn").addEventListener("click", loadUpdateInfo);
 
   document.getElementById("allow-remote-toggle").addEventListener("change", async (e) => {
     const checked = e.target.checked;
