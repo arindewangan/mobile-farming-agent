@@ -1,0 +1,27 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+proxies:
+  - name: "ws-pl"
+    type: socks5
+    server: 84.247.60.125
+    port: 6095
+    username: spvqvpdt
+    password: pya9hgnftuee
+    udp: true
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: ["ws-pl"]
+rules:
+  - MATCH,PROXY

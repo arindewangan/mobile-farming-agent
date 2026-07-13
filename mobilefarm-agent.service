@@ -1,0 +1,19 @@
+[Unit]
+Description=Mobile Farming Agent (listen mode)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/mobilefarm-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/mobilefarm-agent/.venv/bin/python agent.py --listen 0.0.0.0:8091 --admin-port 8090 --connections-file /opt/mobilefarm-agent/data/connections.json --id CHANGE_ME
+# always (not on-failure): a fleet-push self-update (see agent/selfupdate.py)
+# deliberately exits cleanly to relaunch on the new code — that still needs
+# to come back up, not just crash-restarts.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

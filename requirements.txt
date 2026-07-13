@@ -1,0 +1,16 @@
+websockets==14.1
+Pillow==11.1.0
+# --listen (server) mode's local admin panel (connections/tokens management)
+fastapi==0.115.6
+uvicorn==0.34.0
+# no-LLM on-device vision (Tier-1): OpenCV template match + RapidOCR (PP-OCR ONNX,
+# CPU-only, models bundled — no system binary, no GPU, nothing leaves the box)
+opencv-python-headless
+numpy
+rapidocr-onnxruntime
+# AI-driven UI automation (droidrun.py) — installs the `mobilerun` CLI this
+# agent shells out to for natural-language tasks/macros. Base install covers
+# the default local-Ollama provider; add extras for a cloud provider chosen
+# in the dashboard's mobilerun settings, e.g.:
+#   pip install "mobilerun[anthropic,openai,google]"
+mobilerun>=0.6.0

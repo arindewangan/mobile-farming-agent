@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Runtime data (--listen mode connections/tokens/admin password — never commit)
+data/
+
+# Logs
+*.log

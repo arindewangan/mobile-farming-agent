@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mobile Farming — Agent Admin</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<div id="login-screen" style="display:none">
+  <div class="brand" style="justify-content:center; margin-bottom:22px">
+    <div class="brand-mark">MF</div>
+    <h1>Agent Admin</h1>
+  </div>
+  <div class="card">
+    <h2>Unlock</h2>
+    <p class="subtle" style="margin-top:0">Enter the admin password to manage this agent.</p>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" id="login-password" placeholder="paste the password…" autofocus />
+    </div>
+    <button id="login-btn" style="width:100%">Unlock</button>
+    <p class="subtle" style="margin-bottom:0; margin-top:12px">First run? The password was printed to the console
+      (<span class="mono">journalctl -u mobilefarm-agent -f</span>) or is in
+      <span class="mono">data/admin_password.txt</span>.</p>
+  </div>
+</div>
+
+<div id="main-screen" style="display:none">
+  <nav class="sidebar">
+    <div class="sidebar-header">
+      <div class="brand">
+        <div class="brand-mark">MF</div>
+        <div>
+          <h1 style="font-size:14px">Agent Admin</h1>
+        </div>
+      </div>
+    </div>
+    <div class="navitem active" data-page="overview"><span class="dot"></span>Overview</div>
+    <div class="navitem" data-page="connections"><span class="dot"></span>Connections</div>
+    <div class="navitem" data-page="devices"><span class="dot"></span>Devices</div>
+    <div class="navitem" data-page="network"><span class="dot"></span>Network</div>
+    <div class="navitem" data-page="security"><span class="dot"></span>Security</div>
+    <div class="sidebar-footer">
+      <div class="sidebar-status" id="sidebar-status"><span class="dot"></span>—</div>
+      <button class="secondary sm" id="logout-btn">Log out</button>
+    </div>
+  </nav>
+
+  <div class="content">
+    <div id="new-token-banner" class="new-token-banner" style="display:none"></div>
+
+    <!-- OVERVIEW -->
+    <section class="page active" data-page="overview">
+      <div class="content-header"><h1>Overview</h1><div class="subtle">Where this agent can be reached, and who's connected right now.</div></div>
+
+      <div class="card">
+        <h2>Addresses</h2>
+        <div class="grid-2">
+          <div>
+            <div class="kv"><span class="k">Local (same WiFi/LAN)</span></div>
+            <div class="tokenbox"><span class="mono" id="local-addr-box">—</span>
+              <button class="icbtn" data-copy="local-addr-box">copy</button></div>
+          </div>
+          <div>
+            <div class="kv"><span class="k">Remote (Tailscale)</span></div>
+            <div class="tokenbox"><span class="mono" id="remote-addr-box">—</span>
+              <button class="icbtn" data-copy="remote-addr-box">copy</button></div>
+          </div>
+        </div>
+        <div class="section-title">Tailscale</div>
+        <div class="kv"><span class="k">Status</span><span class="v" id="ts-status">—</span></div>
+        <div class="kv"><span class="k">Hostname</span><span class="v mono" id="ts-hostname">—</span></div>
+        <div class="kv"><span class="k">Peers online</span><span class="v" id="ts-peers">—</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Access control</h2>
+        <div class="row between" style="padding:2px 0">
+          <div>
+            <div>Allow remote connections (outside this WiFi/LAN)</div>
+            <div class="subtle">Off = only devices on the same network as this device can connect, regardless of token.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="allow-remote-toggle" /><span class="slider"></span></label>
+        </div>
+        <div id="peer-wrap"></div>
+        <div id="observers-wrap"></div>
+      </div>
+    </section>
+
+    <!-- CONNECTIONS -->
+    <section class="page" data-page="connections">
+      <div class="content-header"><h1>Connections</h1><div class="subtle">Tokens the main dashboard uses to reach this agent, each scoped to where it's allowed to be used from.</div></div>
+      <div class="card">
+        <div class="row" style="margin-bottom:12px">
+          <input type="text" id="new-name" placeholder="name this connection (e.g. dashboard-prod)" />
+          <select id="new-scope">
+            <option value="both">local + remote</option>
+            <option value="local">local only</option>
+            <option value="remote">remote only</option>
+          </select>
+          <button id="create-btn" style="flex:none">Create</button>
+        </div>
+        <div class="tablewrap" id="connections-wrap"><div class="empty">loading…</div></div>
+      </div>
+    </section>
+
+    <!-- DEVICES -->
+    <section class="page" data-page="devices">
+      <div class="content-header"><h1>Devices</h1><div class="subtle">ADB devices attached to this agent. Hidden devices stay attached but never appear on the main dashboard.</div></div>
+      <div class="card">
+        <div class="tablewrap" id="devices-wrap"><div class="empty">loading…</div></div>
+      </div>
+    </section>
+
+    <!-- NETWORK -->
+    <section class="page" data-page="network">
+      <div class="content-header"><h1>Network traffic</h1><div class="subtle">Bytes moved by the current control-plane session, and lifetime totals per network interface.</div></div>
+      <div class="card">
+        <div id="traffic-wrap"><div class="empty">loading…</div></div>
+      </div>
+    </section>
+
+    <!-- SECURITY -->
+    <section class="page" data-page="security">
+      <div class="content-header"><h1>Security</h1><div class="subtle">Banned addresses and a log of recent connection attempts.</div></div>
+      <div class="card">
+        <h2>Banned IPs</h2>
+        <p class="subtle">A banned address is rejected before it even gets to present a token.</p>
+        <div class="row" style="margin-bottom:12px">
+          <input type="text" id="ban-ip" placeholder="IP address to ban" />
+          <input type="text" id="ban-reason" placeholder="reason (optional)" />
+          <button id="ban-btn" style="flex:none">Ban</button>
+        </div>
+        <div class="tablewrap" id="bans-wrap"><div class="empty">loading…</div></div>
+      </div>
+      <div class="card">
+        <h2>Recent connection attempts</h2>
+        <div class="tablewrap" id="log-wrap"><div class="empty">loading…</div></div>
+      </div>
+      <div class="card">
+        <h2>Change password</h2>
+        <p class="subtle">Changing this signs out every other device currently logged into this admin panel — you'll stay signed in here.</p>
+        <div class="field">
+          <label>Current password</label>
+          <input type="password" id="cp-old" autocomplete="current-password" />
+        </div>
+        <div class="field">
+          <label>New password</label>
+          <input type="password" id="cp-new" autocomplete="new-password" placeholder="at least 8 characters" />
+        </div>
+        <div class="field">
+          <label>Confirm new password</label>
+          <input type="password" id="cp-confirm" autocomplete="new-password" />
+        </div>
+        <button id="cp-btn">Change password</button>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

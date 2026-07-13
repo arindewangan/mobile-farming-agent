@@ -1,0 +1,39 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+
+# DNS resolves via DoH (TCP/443) which is itself routed through the proxy below,
+# so there is no plaintext DNS to leak to the local ISP. fake-ip keeps the real
+# hostname resolution at the proxy egress.
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  fallback:
+    - https://1.1.1.1/dns-query
+
+proxies:
+  - name: "ws-jp"
+    type: socks5
+    server: 142.111.67.146
+    port: 5611
+    username: spvqvpdt
+    password: pya9hgnftuee
+    udp: true
+
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+      - ws-jp
+
+# Everything egresses through the proxy — no direct/bypass rule exists, so a
+# tunnel drop means no route at all (fail-closed), reinforced by VPN lockdown.
+rules:
+  - MATCH,PROXY

@@ -1,0 +1,29 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: warning
+ipv6: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  fallback:
+    - https://1.1.1.1/dns-query
+proxies:
+  - name: "mf-proxy"
+    type: socks5
+    server: 31.59.20.176
+    port: 6754
+    username: spvqvpdt
+    password: pya9hgnftuee
+    udp: true
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: ["mf-proxy"]
+rules:
+  - MATCH,PROXY
