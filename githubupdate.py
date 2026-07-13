@@ -18,6 +18,7 @@ VERSION file holds the bare `X.Y.Z` (no `v` prefix) — see current_version().
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -40,13 +41,20 @@ def _get_json(url: str, timeout: float = 15.0) -> dict:
         return json.loads(resp.read())
 
 
-def check_latest() -> dict:
+async def check_latest() -> dict:
     """{"ok", "current", "latest", "tag", "update_available", "url", "notes"}
     on success, or {"ok": False, "error", "current"} if the check itself
-    failed (e.g. offline, rate-limited, or a private repo with no token)."""
+    failed (e.g. offline, rate-limited, or a private repo with no token).
+
+    Offloads the actual network call to a thread — this runs on the same
+    event loop as every device's command dispatch, mirror streaming, and
+    the heartbeat that keeps the backend from reaping this agent as dead
+    (see agent.py's own module docstring on the 20s heartbeat budget); a
+    blocking urlopen() here would freeze the ENTIRE host, not just this
+    one request, for as long as GitHub takes to answer."""
     current = selfupdate.current_version()
     try:
-        data = _get_json(API_LATEST)
+        data = await asyncio.to_thread(_get_json, API_LATEST)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return {"ok": False, "error": f"no releases published yet for {REPO}", "current": current}
@@ -70,17 +78,31 @@ def _download_and_extract(tag: str, work_dir: str) -> str:
     it, stripping the single wrapping top-level folder GitHub always adds
     (`<repo>-<tag-without-v>/`) so the returned dir directly contains
     agent.py etc. — the same shape selfupdate.py's own bundle extraction
-    produces, which is what install_from() expects."""
+    produces, which is what install_from() expects.
+
+    Synchronous/blocking (network + disk I/O) by design — always called via
+    asyncio.to_thread() from apply_latest(), never awaited directly, for the
+    same reason check_latest() offloads its own network call (see that
+    function's docstring)."""
     zip_path = os.path.join(work_dir, "src.zip")
     req = urllib.request.Request(ARCHIVE_URL.format(tag=tag), headers={"User-Agent": _UA})
     with urllib.request.urlopen(req, timeout=120) as resp, open(zip_path, "wb") as f:  # noqa: S310
         shutil.copyfileobj(resp, f)
 
     extract_root = os.path.join(work_dir, "extracted")
+    extract_root_abs = os.path.abspath(extract_root)
     with zipfile.ZipFile(zip_path) as zf:
-        # zip-slip guard, matching selfupdate.py's own _extract_bundle().
+        # zip-slip guard — abspath+containment check, matching selfupdate.py's
+        # own _extract_bundle() exactly (the previous string-based check here
+        # missed Windows drive-letter/UNC members like "C:\\evil\\x", which
+        # os.path.join treats as absolute and discards extract_root for;
+        # os.path.abspath resolves that correctly so the containment check
+        # below still catches it — zipfile's own extractall() independently
+        # neutralizes such members too, so this wasn't actually exploitable,
+        # but the guard should mean what its docstring claims).
         for member in zf.namelist():
-            if member.startswith("/") or ".." in member.replace("\\", "/").split("/"):
+            target = os.path.abspath(os.path.join(extract_root, member))
+            if target != extract_root_abs and not target.startswith(extract_root_abs + os.sep):
                 raise ValueError(f"unsafe path in release archive: {member}")
         zf.extractall(extract_root)
     os.remove(zip_path)
@@ -98,7 +120,7 @@ async def apply_latest() -> dict:
     pushed one would be. Does NOT restart — same contract as
     selfupdate.apply_update(); the caller sends the result back, then calls
     selfupdate.schedule_restart()."""
-    info = check_latest()
+    info = await check_latest()
     if not info["ok"]:
         return {"ok": False, "error": info["error"]}
     if not info["update_available"]:
@@ -106,7 +128,7 @@ async def apply_latest() -> dict:
 
     work = tempfile.mkdtemp(prefix="mf_ghupdate_")
     try:
-        src_dir = _download_and_extract(info["tag"], work)
+        src_dir = await asyncio.to_thread(_download_and_extract, info["tag"], work)
         return await selfupdate.install_from(src_dir, info["latest"])
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"download/extract failed: {e}"}

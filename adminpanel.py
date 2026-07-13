@@ -165,7 +165,7 @@ def create_app(
     # Tailscale, never the open internet. ----------------------------------
     @app.get("/api/update/check", dependencies=[Depends(require_session)])
     async def update_check():
-        return githubupdate.check_latest()
+        return await githubupdate.check_latest()
 
     @app.post("/api/update/apply", dependencies=[Depends(require_session)])
     async def update_apply():
