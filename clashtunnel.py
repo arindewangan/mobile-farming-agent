@@ -71,6 +71,14 @@ def gen_config(proxy: dict) -> str:
     itself matched by ``MATCH,PROXY`` and thus tunnelled — no plaintext DNS
     leaves the device. ``ipv6: false`` + the tun's unreachable v6 route + VPN
     lockdown together guarantee no v6 leak.
+
+    QUIC (UDP/443) is REJECTed so YouTube/Chromium fall back to HTTPS-over-TCP.
+    UDP egress needs a *real* IP (fake-ip's hostname-forwarding doesn't apply to
+    the proxy's UDP relay), which forces a real DoH lookup — and that DoH CONNECT
+    is refused through these proxies, so QUIC video + consent submission would
+    hang. On TCP the hostname is forwarded to the proxy, which resolves it itself
+    (verified: a ``socks5h`` curl through every node succeeds), so everything
+    works without the device ever needing a working DoH path.
     """
     ptype = str(proxy.get("type", "socks5")).lower()
     is_socks = ptype.startswith("socks")
@@ -110,6 +118,7 @@ proxy-groups:
     type: select
     proxies: ["{PROFILE_NAME}"]
 rules:
+  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
   - MATCH,PROXY
 """
 

@@ -59,6 +59,14 @@ _GOOGLE_PKGS = {"com.google.android.gms", "com.google.android.gsf",
 _CUR_QUERY: dict[str, str] = {}
 _NODE_BOUNDS = re.compile(r'text="([^"]*)"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
 
+# Text of the cookie-consent gate. The gate is a webview with an EMPTY a11y tree,
+# so it is only visible to OCR — never to uiautomator/_ui. "a google company" is the
+# subtitle under the YouTube logo at the very top of the gate: unique to this
+# interstitial and visible in every scroll position / orientation while it's up, so
+# it's the most reliable single marker (the heading/body only show near the top).
+_CONSENT_MARKERS = ("a google company", "before you continue", "we use cookies",
+                    "deliver and maintain google")
+
 
 def _now() -> float:
     return time.monotonic()
@@ -543,6 +551,68 @@ async def _open_url(serial: str, url: str) -> None:
         await adb.shell(serial, f"am start -a android.intent.action.VIEW -d '{q}' {PKG}")
 
 
+<<<<<<< Updated upstream
+=======
+async def _consent_up(serial: str, jpeg: bytes | None = None) -> bool:
+    """OCR-detect the cookie-consent gate. It is a webview with an EMPTY a11y tree,
+    so pixels are the ONLY reliable signal — its heading/body text, or the two
+    standalone consent buttons at the bottom of the page."""
+    texts = await vision.ocr_read(serial, jpeg=jpeg)
+    joined = " ".join(t["text"].lower() for t in texts)
+    if any(mk in joined for mk in _CONSENT_MARKERS):
+        return True
+    return any(t["text"].strip().lower().rstrip(".") in ("reject all", "accept all")
+               for t in texts)
+
+
+def _consent_button(texts: list[dict], label: str) -> dict | None:
+    """The real consent button is a SHORT standalone OCR token ('Reject all'),
+    NOT the body sentences that quote "Accept all"/"Reject all" — so match the
+    whole token exactly rather than as a substring."""
+    for t in texts:
+        if t["text"].strip().lower().rstrip(".") == label:
+            return t
+    return None
+
+
+async def _dismiss_consent(serial: str, ctrl, bh: Behavior) -> bool:
+    """Dismiss Google/YouTube's cookie-consent gate ("Before you continue to
+    YouTube …") when it's up — it blocks every flow until handled. The gate is a
+    webview whose buttons are NOT in the a11y tree and sit at the bottom of a long
+    page, so DETECT it by OCR and TAP 'Reject all' (privacy-preserving; 'Accept
+    all' only as a fallback) off the pixels. One-time per device — the app
+    remembers the choice, so it never shows again."""
+    if not await _consent_up(serial):
+        return False
+    _log(serial, "consent gate up — scrolling to the buttons to tap 'Reject all'")
+    W, H = ctrl.width, ctrl.height
+    prev = None
+    for _ in range(8):                       # button block is at the bottom of a long page
+        texts = await vision.ocr_read(serial)
+        rej = _consent_button(texts, "reject all")
+        acc = _consent_button(texts, "accept all")
+        # Tap only once we're at the button block — both buttons visible, or 'Reject
+        # all' alongside the 'More options' anchor that sits just below it. That way a
+        # mid-page paragraph quoting a label can never be mistaken for the button.
+        at_block = rej is not None and (acc is not None or _consent_button(texts, "more options") is not None)
+        if at_block:
+            target, label = (rej, "Reject all") if rej else (acc, "Accept all")
+            await _click(serial, target["x"], target["y"])
+            await bh.pause(1.8, 3.2)
+            cleared = not await _consent_up(serial)
+            _log(serial, f"tapped '{label}' — consent {'cleared' if cleared else 'still up, retrying'}")
+            if cleared:
+                return True
+        sig = tuple(t["text"] for t in texts)
+        if sig == prev:                      # reached the bottom, nothing left to scroll
+            break
+        prev = sig
+        await humanize.human_scroll(ctrl, W, H, "up", 0.8)
+        await bh.pause(0.5, 1.1)
+    return not await _consent_up(serial)
+
+
+>>>>>>> Stashed changes
 async def _await_online(serial: str, ctrl, bh: Behavior, timeout: float = 22.0) -> dict:
     """After navigation, make sure YouTube is actually online. A dead device proxy
     shows the 'You're offline' wall while the OS still pings — RETRY a few times,
@@ -1017,8 +1087,101 @@ async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
 
 
 # ---------------------------------------------------------- dispatch ---------
+async def _proxy_dns_failing(serial: str) -> bool:
+    """True if the device's Clash/CMFA tunnel is failing DNS right now. When the
+    assigned upstream proxy is dead/bandwidth-capped, the tunnel logs a flood of
+    'all DNS requests failed' — which is why a consent 'Reject all' POST (and video
+    playback) can't complete. Distinguishes 'the tap didn't work' (our problem) from
+    'the proxy is down' (infrastructure) so the operator fixes the right thing."""
+    r = await adb.shell(serial, "logcat -d -t 250 -v brief 2>/dev/null | grep -c 'all DNS requests failed'")
+    try:
+        return int((r.get("stdout", "") or "0").strip()) >= 3
+    except ValueError:
+        return False
+
+
+async def onboard(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    """One-time device prep so signed-out YouTube flows run unblocked. There is no
+    Google account on these devices (and none is needed — every watch/search/binge
+    flow works signed-out); the ONLY thing blocking them is the cookie-consent gate.
+    This:
+      1. locks portrait and stops YouTube silently re-enabling auto-rotate on cold
+         launch (so blind positional taps land where OCR sees them),
+      2. opens YouTube to a clean state,
+      3. dismisses the consent gate by tapping 'Reject all',
+      4. confirms the gate is gone and YouTube is foreground.
+    Idempotent: a device already past consent just verifies and returns ok."""
+    _log(serial, "onboard start")
+    # Belt-and-suspenders: block YouTube from turning auto-rotate back on. _force_portrait
+    # re-asserts the lock post-launch regardless, but this keeps idle devices portrait too.
+    await adb.shell(serial, f"appops set {PKG} WRITE_SETTINGS ignore")
+    await _set_orientation(serial, "portrait")
+    # The consent 'Reject all' POST goes through the device's proxy and its success is
+    # flaky per exit node / moment (some proxies Google accepts on the first tap; others
+    # spin and reset). Consent is one-time + persisted locally, so a device only needs
+    # ONE success — retry the WHOLE cycle (fresh relaunch → fresh consent page → fresh
+    # submission) a few times. A cooperating proxy clears on attempt 1.
+    attempts = max(1, int(p.get("consent_attempts", 4)))
+    dismissed = still_gate = False
+    for attempt in range(1, attempts + 1):
+        await adb.force_stop(serial, PKG)
+        await bh.pause(0.8, 1.6)
+        await adb.launch_package(serial, PKG)
+        await asyncio.sleep(bh.think(300))
+        await _force_portrait(serial, bh)          # YouTube flips landscape on cold start
+        # The consent WebView is network-bound and can take several seconds to render.
+        gate = False
+        deadline = _now() + 20
+        while _now() < deadline:
+            if await _consent_up(serial):
+                gate = True
+                break
+            await asyncio.sleep(1.0)
+        if not gate:                               # already past consent (or it cleared)
+            _log(serial, "no consent gate detected — already past it")
+            still_gate = False
+            break
+        await _force_portrait(serial, bh)          # portrait so OCR coords tap correctly
+        dismissed = await _dismiss_consent(serial, ctrl, bh)
+        await _force_portrait(serial, bh)
+        still_gate = await _consent_up(serial)
+        if not still_gate:
+            _log(serial, f"consent cleared on attempt {attempt}/{attempts}")
+            break
+        _log(serial, f"consent still up after attempt {attempt}/{attempts} — retrying fresh")
+        await bh.pause(2.0, 4.0)
+    # This YouTube build barely exposes the Home feed to a11y, so don't hard-gate on
+    # home_markers — the real success signal is "consent gone AND still in YouTube".
+    fg = await _foreground_pkg(serial)
+    ok = (fg == PKG) and not still_gate
+    res = {"ok": ok, "flow": "onboard", "consent_dismissed": dismissed,
+           "consent_cleared": not still_gate, "foreground": fg, "portrait_locked": True,
+           "attempts": attempt}
+    if not ok:
+        res["status"] = "blocked"
+        if still_gate and await _proxy_dns_failing(serial):
+            # Tap registered but the consent POST never completes AND the tunnel is
+            # flooding DNS failures — the assigned exit node won't complete Google's
+            # consent flow. Infrastructure, not automation: reassign to another proxy.
+            res["reason"] = (f"consent tap registered but its submission didn't complete after "
+                             f"{attempt} attempts — the device's proxy exit node won't complete "
+                             f"Google's consent flow. Reassign to a different proxy.")
+            res["proxy_dns_failing"] = True
+        else:
+            res["reason"] = (f"consent gate still up after {attempt} Reject-all attempts"
+                             if still_gate else f"not in YouTube after onboard (foreground={fg})")
+    _log(serial, f"onboard {'ok' if ok else 'FAILED'} in {attempt} attempt(s) "
+                 f"(cleared={not still_gate} fg={fg})")
+    return res
+
+
 _FLOWS = {"watch_link": watch_link, "search_watch": search_watch,
+<<<<<<< Updated upstream
           "channel_watch": channel_watch, "shorts": shorts}
+=======
+          "channel_watch": channel_watch, "channel_binge": channel_binge,
+          "shorts": shorts, "session": session, "onboard": onboard}
+>>>>>>> Stashed changes
 
 
 def _opt_float(v):
