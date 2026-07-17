@@ -700,6 +700,12 @@ class Agent:
                 result = await adb.shell(serial, payload["cmd"])
             elif action == "install":
                 result = await adb.install(serial, payload["apk_path"])
+            elif action == "clone_package":
+                # Copy an installed package's APK(s) from THIS device onto others
+                # (e.g. clone a modern WebView onto devices stuck on an old one).
+                # No download — it's the source device's own Google-signed binary.
+                result = await adb.clone_package(serial, payload.get("to_serials", []),
+                                                 payload["package"], timeout=float(payload.get("timeout", 600)))
             elif action == "tap":
                 result = await self._tap(serial, int(payload["x"]), int(payload["y"]),
                                          human=bool(payload.get("human", False)))

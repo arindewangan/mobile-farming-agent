@@ -161,6 +161,52 @@ async def install(serial: str, apk_path: str) -> dict:
     return {"ok": rc == 0 and "Success" in output, "output": output}
 
 
+async def apk_paths(serial: str, package: str) -> list[str]:
+    """On-device APK path(s) for an installed package — a modern app is often a
+    base.apk PLUS split_config.* APKs, so this returns a list."""
+    rc, out, _ = await _run(["-s", serial, "shell", "pm", "path", package], timeout=20)
+    return [ln.split("package:", 1)[1].strip()
+            for ln in out.decode(errors="replace").splitlines() if ln.startswith("package:")]
+
+
+async def clone_package(from_serial: str, to_serials: list, package: str, timeout: float = 600.0) -> dict:
+    """Copy an installed package's APK(s) from one device to others — no
+    download, it's the source device's own (Google-signed) binary. Pulls every
+    part (base + splits) to a temp dir on the agent host, then installs them on
+    each target with install-multiple (or install for a single APK). Used to
+    clone a modern WebView from a device that has it onto ones stuck on an old
+    version. `-r` reinstalls keeping data, `-d` allows the version-code check to
+    pass for a system-app update."""
+    import os
+    import shutil
+    import tempfile
+    paths = await apk_paths(from_serial, package)
+    if not paths:
+        return {"ok": False, "error": f"{package} not installed on source {from_serial}"}
+    work = tempfile.mkdtemp(prefix="mf_clone_")
+    local: list[str] = []
+    try:
+        for i, p in enumerate(paths):
+            dest = os.path.join(work, f"part{i}.apk")
+            rc, out, err = await _run(["-s", from_serial, "pull", p, dest], timeout=240)
+            if rc != 0 or not os.path.exists(dest):
+                return {"ok": False, "error": f"pull {p} failed: {(out + err).decode(errors='replace')[:200]}"}
+            local.append(dest)
+        results: dict = {}
+        for ser in to_serials:
+            if len(local) == 1:
+                rc, out, err = await _run(["-s", ser, "install", "-r", "-d", local[0]], timeout=300)
+            else:
+                rc, out, err = await _run(["-s", ser, "install-multiple", "-r", "-d", *local], timeout=360)
+            output = (out + err).decode(errors="replace").strip()
+            results[ser] = {"ok": rc == 0 and "Success" in output, "output": output[:300]}
+        ok = all(r["ok"] for r in results.values()) if results else False
+        return {"ok": ok, "package": package, "source": from_serial,
+                "parts": len(local), "results": results}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 async def tap(serial: str, x: int, y: int) -> dict:
     rc, _, err = await _run(["-s", serial, "shell", "input", "tap", str(x), str(y)])
     return {"ok": rc == 0, "error": err.decode(errors="replace")}
