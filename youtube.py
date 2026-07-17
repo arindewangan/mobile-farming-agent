@@ -551,8 +551,6 @@ async def _open_url(serial: str, url: str) -> None:
         await adb.shell(serial, f"am start -a android.intent.action.VIEW -d '{q}' {PKG}")
 
 
-<<<<<<< Updated upstream
-=======
 async def _consent_up(serial: str, jpeg: bytes | None = None) -> bool:
     """OCR-detect the cookie-consent gate. It is a webview with an EMPTY a11y tree,
     so pixels are the ONLY reliable signal — its heading/body text, or the two
@@ -612,7 +610,6 @@ async def _dismiss_consent(serial: str, ctrl, bh: Behavior) -> bool:
     return not await _consent_up(serial)
 
 
->>>>>>> Stashed changes
 async def _await_online(serial: str, ctrl, bh: Behavior, timeout: float = 22.0) -> dict:
     """After navigation, make sure YouTube is actually online. A dead device proxy
     shows the 'You're offline' wall while the OS still pings — RETRY a few times,
@@ -631,7 +628,9 @@ async def _await_online(serial: str, ctrl, bh: Behavior, timeout: float = 22.0) 
                 continue
             return {"ok": False, "status": "blocked",
                     "reason": "device offline — app can't reach the internet (dead proxy? check tunnel/network)"}
+        await _dismiss_consent(serial, ctrl, bh)   # clear the cookie-consent gate if up
         return {"ok": True}
+    await _dismiss_consent(serial, ctrl, bh)
     return {"ok": True}
 
 
@@ -965,14 +964,18 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     await _set_orientation(serial, bh.orientation)
     await adb.force_stop(serial, PKG)
     await bh.pause(0.8, 1.7)
-    direct = channel.startswith(("@", "http", "UC"))
+    # NB: a bare "@handle" URL (youtube.com/@Name) is NOT handled by the app's
+    # UrlActivity — it punts to the system browser (Samsung Internet), which then
+    # traps the flow. Only real URLs / channel-IDs deep-link cleanly; route @handles
+    # (and plain names) through in-app search instead, which is reliable.
+    direct = channel.startswith(("http", "UC"))
     if direct:
         _log(serial, f"opening channel {channel}")
         await _open_url(serial, _channel_url(channel))
     else:
         # a plain name → open results filtered to CHANNELS, then tap the top channel
         _log(serial, f"searching channels for '{channel}'")
-        await _open_url(serial, _yt_search_url(channel, "EgIQAg%3D%3D"))
+        await _open_url(serial, _yt_search_url(channel.lstrip("@"), "EgIQAg%3D%3D"))
     on = await _await_online(serial, ctrl, bh, timeout=25)
     if not on["ok"]:
         return _abort("channel_watch", on)
@@ -997,6 +1000,65 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     await _close_app(serial, ctrl, bh)
     _log(serial, f"done: watched {res.get('watched_s')}s")
     return {"ok": True, "flow": "channel_watch", "channel": channel, "opened_video": on_watch, **res}
+
+
+async def channel_binge(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    """Watch several of ONE channel's videos IN ORDER, navigating its Videos tab in
+    place: open the channel once, then watch → back → advance down the list → watch
+    the next. Progresses through the tab's order (newest first) rather than
+    re-opening + re-picking (which can repeat). Stops at ``count`` videos or the
+    ``max_run_s`` deadline. On a pick miss it hands off to the LLM (if enabled)."""
+    channel = str(p.get("channel") or p.get("query") or "").strip()
+    if not channel:
+        return _abort("channel_binge", {"status": "unknown", "reason": "no channel given"})
+    count = max(1, int(p.get("count", 5)))
+    tab = str(p.get("tab", "Videos") or "Videos")
+    ws = p.get("watch_s", 180)
+    await _set_orientation(serial, bh.orientation)
+    await adb.force_stop(serial, PKG)
+    await bh.pause(0.8, 1.7)
+    # NB: a bare "@handle" URL (youtube.com/@Name) is NOT handled by the app's
+    # UrlActivity — it punts to the system browser (Samsung Internet), which then
+    # traps the flow. Only real URLs / channel-IDs deep-link cleanly; route @handles
+    # (and plain names) through in-app search instead, which is reliable.
+    direct = channel.startswith(("http", "UC"))
+    await _open_url(serial, _channel_url(channel) if direct else _yt_search_url(channel.lstrip("@"), "EgIQAg%3D%3D"))
+    on = await _await_online(serial, ctrl, bh, timeout=25)
+    if not on["ok"]:
+        return _abort("channel_binge", on)
+    await _set_orientation(serial, bh.orientation)
+    await bh.pause(1.5, 3.0)
+    if not direct:                                   # a plain name → tap the top channel row
+        await _click(serial, ctrl.width * random.uniform(0.25, 0.45),
+                     ctrl.height * random.uniform(0.24, 0.32))
+        await bh.pause(1.5, 3.0)
+    await _find_and_tap(serial, ctrl, tab, tab.upper(), ocr=True)
+    await bh.pause(0.9, 2.0)
+
+    watched = []
+    for i in range(count):
+        if bh.expired():
+            break
+        if i > 0:
+            # advance down the Videos list so the next (unwatched) video sits on top
+            await humanize.human_scroll(ctrl, ctrl.width, ctrl.height, "up",
+                                        random.uniform(0.45, 0.7))
+            await bh.pause(0.6, 1.5)
+        opened = await _pick_result(serial, ctrl, bh)
+        if not opened:
+            st = await _reach(serial, ctrl, bh, *bh.sel("watch_markers"),
+                              goal="Open the next video in this channel's Videos list.", timeout=15)
+            if not st["ok"]:
+                break
+        await _set_orientation(serial, bh.orientation)
+        res = await _watch_video(serial, ctrl, bh, _watch_s_pick(ws))
+        watched.append({"n": i + 1, "watched_s": res.get("watched_s")})
+        _log(serial, f"channel_binge {i+1}/{count}: watched {res.get('watched_s')}s")
+        await adb.keyevent(serial, "KEYCODE_BACK")    # back to the Videos list
+        await bh.pause(1.2, 2.8)
+    await _close_app(serial, ctrl, bh)
+    return {"ok": bool(watched), "flow": "channel_binge", "channel": channel,
+            "count": len(watched), "detail": watched}
 
 
 async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
@@ -1084,6 +1146,90 @@ async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     await _close_app(serial, ctrl, bh)
     return {"ok": True, "flow": "shorts", "watched": watched, "liked": liked,
             "duration_s": round(_now() - start, 1), "channel": channel}
+
+
+def _watch_s_pick(spec) -> float:
+    """A single-video watch time from either a fixed number or a [min,max] range
+    (so each video in a session gets its own varied duration)."""
+    if isinstance(spec, (list, tuple)) and len(spec) == 2:
+        return random.uniform(float(spec[0]), float(spec[1]))
+    return float(spec or 120)
+
+
+async def session(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    """Watch a SESSION of many videos in a chosen pattern, reusing the single-video
+    flows so every video keeps the full human behaviour (pause/resume/skip/like,
+    varied watch time, boredom). Stops at ``count`` videos or the ``max_run_s``
+    session deadline, whichever comes first, with a human gap between videos.
+
+    patterns:
+      channels  — watch videos from ``channels`` (cycled; set mix/order=random)
+      mix       — interleave videos across several ``channels`` round-robin
+      search    — watch videos for each of ``queries`` (interest-based)
+      random    — watch varied videos (random ``queries`` or a broad default pool)
+      links     — watch a list of specific ``urls`` (order sequential|random)
+    Watch time: ``watch_s`` may be a number or a [min,max] range (varied per video)."""
+    pattern = str(p.get("pattern", "search")).lower()
+    count = max(1, int(p.get("count", 3)))
+    order = str(p.get("order", "sequential")).lower()
+    ws = p.get("watch_s", 120)
+    channels = list(p.get("channels") or ([p["channel"]] if p.get("channel") else []))
+    queries = list(p.get("queries") or ([p["query"]] if p.get("query") else []))
+    urls = list(p.get("urls") or ([p["url"]] if p.get("url") else []))
+
+    plan: list[tuple] = []
+    if pattern in ("channels", "channel", "mix"):
+        if not channels:
+            return _abort("session", {"status": "unknown", "reason": "pattern needs 'channels'"})
+        for i in range(count):
+            if pattern == "mix" or p.get("mix"):
+                ch = channels[i % len(channels)]                 # round-robin interleave
+            elif order == "random":
+                ch = random.choice(channels)
+            else:
+                ch = channels[i % len(channels)]                 # cycle through the list
+            plan.append((channel_watch, {"channel": ch, "tab": p.get("tab", "Videos")}))
+    elif pattern in ("search", "interest"):
+        if not queries:
+            return _abort("session", {"status": "unknown", "reason": "pattern needs 'queries'"})
+        for i in range(count):
+            q = random.choice(queries) if order == "random" else queries[i % len(queries)]
+            plan.append((search_watch, {"query": q, "sort": p.get("sort", "")}))
+    elif pattern == "random":
+        pool = queries or ["music", "news today", "documentary", "gaming highlights",
+                           "podcast", "movie trailer", "how to", "travel vlog", "live"]
+        for _ in range(count):
+            plan.append((search_watch, {"query": random.choice(pool),
+                                        "sort": random.choice(["", "date", "viewcount"])}))
+    elif pattern == "links":
+        if not urls:
+            return _abort("session", {"status": "unknown", "reason": "pattern needs 'urls'"})
+        seq = list(urls)
+        if order == "random":
+            random.shuffle(seq)
+        for u in seq[:count if count < len(seq) else len(seq)]:
+            plan.append((watch_link, {"url": u}))
+    else:
+        return _abort("session", {"status": "unknown", "reason": f"unknown pattern '{pattern}'"})
+
+    watched: list[dict] = []
+    for i, (fn, sub) in enumerate(plan, 1):
+        if bh.expired():
+            _log(serial, f"session: max_run_s reached after {len(watched)} video(s)")
+            break
+        sub = {**sub, "watch_s": _watch_s_pick(ws)}
+        try:
+            r = await fn(serial, ctrl, sub, bh)
+        except Exception as e:  # noqa: BLE001
+            r = {"ok": False, "error": str(e)}
+        watched.append({"n": i, "flow": r.get("flow"), "ok": bool(r.get("ok")),
+                        "watched_s": r.get("watched_s")})
+        _log(serial, f"session {i}/{len(plan)}: {r.get('flow')} ok={r.get('ok')}")
+        if i < len(plan) and not bh.expired():
+            await bh.pause(1.5, 5.0)          # a human gap before the next video
+    return {"ok": any(w["ok"] for w in watched), "flow": "session", "pattern": pattern,
+            "videos_ok": sum(1 for w in watched if w["ok"]), "planned": len(plan),
+            "detail": watched}
 
 
 # ---------------------------------------------------------- dispatch ---------
@@ -1176,12 +1322,8 @@ async def onboard(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
 
 
 _FLOWS = {"watch_link": watch_link, "search_watch": search_watch,
-<<<<<<< Updated upstream
-          "channel_watch": channel_watch, "shorts": shorts}
-=======
           "channel_watch": channel_watch, "channel_binge": channel_binge,
           "shorts": shorts, "session": session, "onboard": onboard}
->>>>>>> Stashed changes
 
 
 def _opt_float(v):

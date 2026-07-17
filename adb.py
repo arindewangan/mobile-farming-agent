@@ -174,9 +174,15 @@ async def swipe(serial: str, x1: int, y1: int, x2: int, y2: int, duration_ms: in
 
 
 async def input_text(serial: str, text: str) -> dict:
-    # `input text` needs spaces escaped as %s and cannot type some chars.
-    safe = text.replace(" ", "%s")
-    rc, _, err = await _run(["-s", serial, "shell", "input", "text", safe])
+    # The argument is parsed by the DEVICE'S shell, so any shell metacharacter
+    # (; & | < > ( ) ' " ` $ etc.) is interpreted there — escaping only spaces
+    # both breaks ordinary text (ampersands, quotes, parentheses in a search
+    # query or password) and is a command-injection vector. Wrap the whole
+    # payload in single quotes for the device shell (escaping embedded single
+    # quotes the '\'' way), and substitute spaces with %s INSIDE the quotes,
+    # since `input text` itself wants spaces as %s.
+    escaped = text.replace("'", "'\\''").replace(" ", "%s")
+    rc, _, err = await _run(["-s", serial, "shell", "input", "text", f"'{escaped}'"])
     return {"ok": rc == 0, "error": err.decode(errors="replace")}
 
 
