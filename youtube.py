@@ -991,9 +991,18 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     await humanize.human_scroll(ctrl, ctrl.width, ctrl.height, "up", random.uniform(0.25, 0.7))
     await bh.pause(0.6, 1.8)
     on_watch = await _pick_result(serial, ctrl, bh)
+    if not on_watch and not bh.expired():
+        # A channel page often opens on a non-list state first (a pinned/loading
+        # header, a Shorts shelf, or a full-width promo) so the first pick can
+        # miss. Scroll into the video list and try the picker once more before
+        # falling back to recovery — this is the "unexpected screen" case.
+        _log(serial, "channel_watch: first pick missed — scrolling into the list and retrying")
+        await humanize.human_scroll(ctrl, ctrl.width, ctrl.height, "up", random.uniform(0.4, 0.8))
+        await bh.pause(1.0, 2.2)
+        on_watch = await _pick_result(serial, ctrl, bh)
     if not on_watch:
         st = await _reach(serial, ctrl, bh, *bh.sel("watch_markers"),
-                          goal="You are on a YouTube channel. Open one of the channel's videos so it plays.", timeout=15)
+                          goal="You are on a YouTube channel. Open one of the channel's videos so it plays.", timeout=20)
         if not st["ok"]:
             return _abort("channel_watch", st)
     res = await _watch_video(serial, ctrl, bh, float(p.get("watch_s", 90)))
@@ -1045,9 +1054,13 @@ async def channel_binge(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
                                         random.uniform(0.45, 0.7))
             await bh.pause(0.6, 1.5)
         opened = await _pick_result(serial, ctrl, bh)
+        if not opened and not bh.expired():          # first pick can miss on a mid-load / promo header
+            await humanize.human_scroll(ctrl, ctrl.width, ctrl.height, "up", random.uniform(0.4, 0.8))
+            await bh.pause(1.0, 2.0)
+            opened = await _pick_result(serial, ctrl, bh)
         if not opened:
             st = await _reach(serial, ctrl, bh, *bh.sel("watch_markers"),
-                              goal="Open the next video in this channel's Videos list.", timeout=15)
+                              goal="Open the next video in this channel's Videos list.", timeout=20)
             if not st["ok"]:
                 break
         await _set_orientation(serial, bh.orientation)
@@ -1269,15 +1282,24 @@ async def onboard(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     # submission) a few times. A cooperating proxy clears on attempt 1.
     attempts = max(1, int(p.get("consent_attempts", 4)))
     dismissed = still_gate = False
+    attempt = 0
     for attempt in range(1, attempts + 1):
+        # Respect the run's time budget. On a device whose exit node never
+        # completes Google's consent POST, consent NEVER clears, so without this
+        # onboard would burn every attempt and blow past the dispatch timeout
+        # (the "agent did not answer" hang) instead of giving up at max_run_s.
+        if attempt > 1 and bh.expired():
+            _log(serial, f"onboard: time budget reached — stopping after {attempt - 1} attempt(s)")
+            break
         await adb.force_stop(serial, PKG)
         await bh.pause(0.8, 1.6)
         await adb.launch_package(serial, PKG)
         await asyncio.sleep(bh.think(300))
         await _force_portrait(serial, bh)          # YouTube flips landscape on cold start
-        # The consent WebView is network-bound and can take several seconds to render.
+        # The consent WebView is network-bound and can take several seconds to
+        # render — but never wait longer than the budget that's left.
         gate = False
-        deadline = _now() + 20
+        deadline = _now() + min(20.0, bh.remaining() or 20.0)
         while _now() < deadline:
             if await _consent_up(serial):
                 gate = True
