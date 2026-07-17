@@ -892,7 +892,7 @@ async def _tap_first_suggestion(serial: str, ctrl, bh: Behavior) -> bool:
 # --------------------------------------------------------------- flows -------
 async def watch_link(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     url = str(p["url"]).strip()
-    watch_s = float(p.get("watch_s", 90))
+    watch_s = _watch_s_pick(p.get("watch_s", 90))   # accepts a fixed number OR a [min,max] range
     await _set_orientation(serial, bh.orientation)
     q = url.replace("'", "")
     r = await adb.shell(serial,
@@ -948,7 +948,7 @@ async def search_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         if not st["ok"]:
             return _abort("search_watch", st)
     _log(serial, "watching")
-    res = await _watch_video(serial, ctrl, bh, float(p.get("watch_s", 90)))
+    res = await _watch_video(serial, ctrl, bh, _watch_s_pick(p.get("watch_s", 90)))
     chained = await _maybe_chain(serial, ctrl, bh)
     await _close_app(serial, ctrl, bh)
     _log(serial, f"done: watched {res.get('watched_s')}s ({res.get('actions')}) chained={chained}")
@@ -1005,7 +1005,7 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
                           goal="You are on a YouTube channel. Open one of the channel's videos so it plays.", timeout=20)
         if not st["ok"]:
             return _abort("channel_watch", st)
-    res = await _watch_video(serial, ctrl, bh, float(p.get("watch_s", 90)))
+    res = await _watch_video(serial, ctrl, bh, _watch_s_pick(p.get("watch_s", 90)))
     await _close_app(serial, ctrl, bh)
     _log(serial, f"done: watched {res.get('watched_s')}s")
     return {"ok": True, "flow": "channel_watch", "channel": channel, "opened_video": on_watch, **res}
