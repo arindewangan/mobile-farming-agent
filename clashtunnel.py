@@ -42,6 +42,7 @@ import json
 import os
 import re
 import threading
+import time
 import urllib.parse
 from typing import Optional
 
@@ -58,6 +59,24 @@ APK_PATH = os.path.join(os.path.dirname(__file__), "vendor", "clash",
 PROFILE_NAME = "mf-proxy"
 DEVICE_CFG = "/sdcard/mf-proxy.yaml"
 IP_ECHO = "http://ip-api.com/json?fields=query,country,regionName,city,isp,proxy,hosting,mobile"
+
+
+_profile_seq = 0
+
+
+def _unique_profile_name() -> str:
+    """A fresh CMFA profile name for every import.
+
+    Re-importing under a CONSTANT name is the bug that made proxy switches
+    silently no-op: an old profile of that name is already the selected radio,
+    so select_profile()'s 'already checked -> return' short-circuit fires and
+    the newly-imported config never becomes active (device keeps its old exit
+    IP, or stays fail-closed on a dead proxy). A unique name each time means
+    the new profile is never pre-selected, so it actually gets tapped/loaded.
+    time + an in-process counter keeps it unique even for back-to-back calls."""
+    global _profile_seq
+    _profile_seq += 1
+    return f"mf-{int(time.time())}-{_profile_seq}"
 
 
 # --------------------------------------------------------------------------- #
@@ -204,23 +223,28 @@ def _serve_bytes(data: bytes) -> tuple[int, http.server.HTTPServer]:
     return httpd.server_address[1], httpd
 
 
-async def import_profile(serial: str, config_yaml: str) -> dict:
-    """Import the config as the ``mf-proxy`` profile and COMMIT it.
+async def import_profile(serial: str, config_yaml: str, profile_name: str = PROFILE_NAME) -> dict:
+    """Import the config as a CMFA profile named ``profile_name`` and COMMIT it.
 
     Served over HTTP via ``adb reverse`` rather than a ``file://`` path: CMFA
     declares no storage permission, so it cannot read a file on /sdcard and the
     import lands 'Unsaved' (unselectable → tunnel never starts). A localhost HTTP
     source works with no permissions. The PropertiesActivity Save action is then
-    tapped (polled until it renders) to actually persist the profile."""
+    tapped (polled until it renders) to actually persist the profile.
+
+    ``profile_name`` should be unique per import (see _unique_profile_name) so
+    a proxy switch produces a brand-new, not-yet-selected profile — otherwise
+    select_profile() can't tell it apart from the old one and never activates
+    it."""
     data = config_yaml.encode()
     port, httpd = _serve_bytes(data)
     try:
         await adb._run(["-s", serial, "reverse", f"tcp:{port}", f"tcp:{port}"])
-        url = urllib.parse.quote(f"http://127.0.0.1:{port}/{PROFILE_NAME}.yaml", safe="")
+        url = urllib.parse.quote(f"http://127.0.0.1:{port}/{profile_name}.yaml", safe="")
         await adb.shell(
             serial,
             f"am start -a android.intent.action.VIEW "
-            f"-d 'clash://install-config?url={url}&name={PROFILE_NAME}' -n {EXT}",
+            f"-d 'clash://install-config?url={url}&name={profile_name}' -n {EXT}",
         )
         saved = False
         for _ in range(6):  # wait for PropertiesActivity to render, then Save
@@ -371,7 +395,9 @@ async def set_proxy(serial: str, proxy: dict, retries: int = 2) -> dict:
     hopeful assumption."""
     if not await is_installed(serial):
         return {"ok": False, "error": "clash not installed — run onboard first"}
-    await import_profile(serial, gen_config(proxy))
+    pname = _unique_profile_name()
+    await import_profile(serial, gen_config(proxy), profile_name=pname)
+    await select_profile(serial, pname)   # activate the freshly-imported profile
     for attempt in range(retries + 1):
         await stop(serial)
         await asyncio.sleep(1.5)
@@ -381,7 +407,7 @@ async def set_proxy(serial: str, proxy: dict, retries: int = 2) -> dict:
         if exit_info.get("ip") == proxy["host"]:
             return {"ok": True, "connected": True, "exit": exit_info,
                     "lockdown": await is_lockdown_armed(serial)}
-        await select_profile(serial)  # self-correct a missed selection
+        await select_profile(serial, pname)  # self-correct a missed selection
     return {"ok": False, "connected": False, "exit": exit_info,
             "expected": proxy["host"],
             "error": "exit IP did not match proxy (profile not active?)"}
@@ -395,8 +421,9 @@ async def onboard(serial: str, proxy: dict) -> dict:
     inst = await install(serial)
     if not inst["ok"]:
         return inst
-    imp = await import_profile(serial, gen_config(proxy))
-    await select_profile(serial)
+    pname = _unique_profile_name()
+    imp = await import_profile(serial, gen_config(proxy), profile_name=pname)
+    await select_profile(serial, pname)
     await start(serial)
     await asyncio.sleep(5)
     before = await verify_exit(serial)
@@ -408,7 +435,7 @@ async def onboard(serial: str, proxy: dict) -> dict:
         after = await verify_exit(serial)
         if after.get("ip") == proxy["host"]:
             break
-        await select_profile(serial)
+        await select_profile(serial, pname)
     return {
         "ok": after.get("ip") == proxy["host"],
         "exit": after, "exit_before_reboot": before,
