@@ -82,11 +82,91 @@ def _unique_profile_name() -> str:
 # --------------------------------------------------------------------------- #
 # config generation
 # --------------------------------------------------------------------------- #
+# How each proxy type spells "the credential". Anything not listed here is
+# still supported — its settings just come through `extra` verbatim.
+_AUTH_KEYS = {
+    "http": ("username", "password"), "https": ("username", "password"),
+    "socks5": ("username", "password"), "socks4": ("username", "password"),
+    "ss": (None, "password"), "trojan": (None, "password"),
+    "hysteria": (None, "password"), "hysteria2": (None, "password"),
+    "snell": (None, "psk"),
+}
+_UDP_TYPES = {"socks5", "ss", "ssr", "vmess", "vless", "trojan",
+              "hysteria", "hysteria2", "tuic", "wireguard", "snell"}
+
+
+def _yaml_scalar(v) -> str:
+    """Render a Python value as a YAML scalar. Strings are quoted (so a password
+    of `@bc#123` or a bare `yes` can't be reinterpreted as YAML syntax)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _yaml_lines(obj, indent: int) -> list[str]:
+    """Emit nested dict/list settings (ws-opts, reality-opts, headers, ...) so
+    protocol-specific config survives round-tripping without a schema for it."""
+    pad = " " * indent
+    out: list[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                out.append(f"{pad}{k}:")
+                out += _yaml_lines(v, indent + 2)
+            else:
+                out.append(f"{pad}{k}: {_yaml_scalar(v)}")
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                out.append(f"{pad}-")
+                out += _yaml_lines(item, indent + 2)
+            else:
+                out.append(f"{pad}- {_yaml_scalar(item)}")
+    return out
+
+
+def _proxy_block(proxy: dict) -> str:
+    """Render ANY supported proxy as a mihomo `proxies:` entry.
+
+    host/port/type plus the type's credential fields are mapped explicitly; every
+    other protocol setting (uuid, cipher, sni, network, ws-opts, obfs, flow, ...)
+    is carried in `extra` and emitted as-is. That means a proxy type we have
+    never special-cased still works as long as the operator supplies its fields —
+    which is the whole point of "use any type of proxy"."""
+    ptype = str(proxy.get("type") or "http").lower()
+    if ptype in ("socks", "socks5h"):
+        ptype = "socks5"
+    if ptype == "auto":                 # never resolved by a health check — assume http
+        ptype = "http"
+    extra = dict(proxy.get("extra") or {})
+
+    lines = [
+        f'  - name: "{PROFILE_NAME}"',
+        f"    type: {ptype}",
+        f'    server: {proxy["host"]}',
+        f'    port: {int(proxy["port"])}',
+    ]
+    user_key, pass_key = _AUTH_KEYS.get(ptype, ("username", "password"))
+    if user_key and proxy.get("username") and user_key not in extra:
+        lines.append(f'    {user_key}: {_yaml_scalar(proxy["username"])}')
+    if pass_key and proxy.get("password") and pass_key not in extra:
+        lines.append(f'    {pass_key}: {_yaml_scalar(proxy["password"])}')
+    if ptype in _UDP_TYPES and "udp" not in extra:
+        lines.append("    udp: true")
+    if ptype == "http" and "tls" not in extra:
+        lines.append("    tls: false")
+    lines += _yaml_lines(extra, 4)
+    return "\n".join(lines)
+
+
 def gen_config(proxy: dict) -> str:
     """Render a hardened mihomo YAML for one upstream proxy.
 
-    ``proxy`` = {host, port, type, username?, password?}. ``type`` starting with
-    "socks" → socks5, else http. DNS is fake-ip over DoH (TCP/443) which is
+    ``proxy`` = {host, port, type, username?, password?, extra?} and may be ANY
+    type mihomo can dial (http/socks5/ss/vmess/vless/trojan/hysteria2/tuic/...);
+    see _proxy_block. DNS is fake-ip over DoH (TCP/443) which is
     itself matched by ``MATCH,PROXY`` and thus tunnelled — no plaintext DNS
     leaves the device. ``ipv6: false`` + the tun's unreachable v6 route + VPN
     lockdown together guarantee no v6 leak.
@@ -99,22 +179,7 @@ def gen_config(proxy: dict) -> str:
     (verified: a ``socks5h`` curl through every node succeeds), so everything
     works without the device ever needing a working DoH path.
     """
-    ptype = str(proxy.get("type", "socks5")).lower()
-    is_socks = ptype.startswith("socks")
-    lines = [
-        f'  - name: "{PROFILE_NAME}"',
-        f'    type: {"socks5" if is_socks else "http"}',
-        f'    server: {proxy["host"]}',
-        f'    port: {int(proxy["port"])}',
-    ]
-    if proxy.get("username"):
-        lines.append(f'    username: {proxy["username"]}')
-        lines.append(f'    password: {proxy.get("password") or ""}')
-    if is_socks:
-        lines.append("    udp: true")
-    else:
-        lines.append("    tls: false")
-    proxy_block = "\n".join(lines)
+    proxy_block = _proxy_block(proxy)
     return f"""mixed-port: 7890
 allow-lan: false
 mode: rule
