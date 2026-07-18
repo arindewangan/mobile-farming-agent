@@ -204,11 +204,19 @@ async def _tap_desc(serial: str, desc: str) -> bool:
 # --------------------------------------------------------------------------- #
 # profile import / selection
 # --------------------------------------------------------------------------- #
-def _serve_bytes(data: bytes) -> tuple[int, http.server.HTTPServer]:
+def _serve_bytes(data: bytes) -> tuple[int, http.server.HTTPServer, dict]:
     """Serve `data` for any GET on an ephemeral localhost port (a per-call server
-    so concurrent onboards never collide). Returns (port, httpd)."""
+    so concurrent onboards never collide). Returns (port, httpd, stats).
+
+    `stats["hits"]` counts how many times the device actually fetched the
+    config — the difference between "we asked CMFA to import" and "CMFA really
+    pulled the bytes". Without it, a broken `adb reverse` looks identical to a
+    successful import that just didn't get saved."""
+    stats = {"hits": 0}
+
     class _H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
+            stats["hits"] += 1
             self.send_response(200)
             self.send_header("Content-Type", "text/yaml")
             self.send_header("Content-Length", str(len(data)))
@@ -220,7 +228,7 @@ def _serve_bytes(data: bytes) -> tuple[int, http.server.HTTPServer]:
 
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _H)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd.server_address[1], httpd
+    return httpd.server_address[1], httpd, stats
 
 
 async def import_profile(serial: str, config_yaml: str, profile_name: str = PROFILE_NAME) -> dict:
@@ -237,9 +245,15 @@ async def import_profile(serial: str, config_yaml: str, profile_name: str = PROF
     select_profile() can't tell it apart from the old one and never activates
     it."""
     data = config_yaml.encode()
-    port, httpd = _serve_bytes(data)
+    port, httpd, stats = _serve_bytes(data)
+    rev_ok, rev_err = False, ""
     try:
-        await adb._run(["-s", serial, "reverse", f"tcp:{port}", f"tcp:{port}"])
+        try:
+            rc, _out, err = await adb._run(["-s", serial, "reverse", f"tcp:{port}", f"tcp:{port}"])
+            rev_ok = rc == 0
+            rev_err = (err or b"").decode(errors="replace").strip()[:200]
+        except Exception as e:  # noqa: BLE001
+            rev_ok, rev_err = False, str(e)[:200]
         url = urllib.parse.quote(f"http://127.0.0.1:{port}/{profile_name}.yaml", safe="")
         await adb.shell(
             serial,
@@ -255,7 +269,11 @@ async def import_profile(serial: str, config_yaml: str, profile_name: str = PROF
                 await asyncio.sleep(2)
                 saved = True
                 break
-        return {"ok": saved, "saved": saved}
+        # Diagnostics: distinguish "reverse failed" / "device never fetched the
+        # config" / "Save button never rendered" — these fail identically today.
+        return {"ok": saved and stats["hits"] > 0, "saved": saved,
+                "reverse_ok": rev_ok, "reverse_err": rev_err,
+                "fetched": stats["hits"], "profile": profile_name}
     finally:
         try:
             await adb._run(["-s", serial, "reverse", "--remove", f"tcp:{port}"])
@@ -396,8 +414,8 @@ async def set_proxy(serial: str, proxy: dict, retries: int = 2) -> dict:
     if not await is_installed(serial):
         return {"ok": False, "error": "clash not installed — run onboard first"}
     pname = _unique_profile_name()
-    await import_profile(serial, gen_config(proxy), profile_name=pname)
-    await select_profile(serial, pname)   # activate the freshly-imported profile
+    imp = await import_profile(serial, gen_config(proxy), profile_name=pname)
+    selected = await select_profile(serial, pname)   # activate the fresh profile
     for attempt in range(retries + 1):
         await stop(serial)
         await asyncio.sleep(1.5)
@@ -406,10 +424,11 @@ async def set_proxy(serial: str, proxy: dict, retries: int = 2) -> dict:
         exit_info = await verify_exit(serial)
         if exit_info.get("ip") == proxy["host"]:
             return {"ok": True, "connected": True, "exit": exit_info,
+                    "import": imp, "selected": selected,
                     "lockdown": await is_lockdown_armed(serial)}
-        await select_profile(serial, pname)  # self-correct a missed selection
+        selected = await select_profile(serial, pname)  # self-correct a missed selection
     return {"ok": False, "connected": False, "exit": exit_info,
-            "expected": proxy["host"],
+            "expected": proxy["host"], "import": imp, "selected": selected,
             "error": "exit IP did not match proxy (profile not active?)"}
 
 
