@@ -266,9 +266,21 @@ async def import_profile(serial: str, config_yaml: str, profile_name: str = PROF
             b = _find_bounds(await _dump_ui(serial), desc="Save")
             if b:
                 await adb.tap(serial, *_center(b))
-                await asyncio.sleep(2)
                 saved = True
                 break
+        # CMFA renders the properties form WITHOUT downloading anything — it
+        # fetches the config only when the profile is committed, which lags the
+        # Save tap by several seconds. The old code slept a flat 2s and then let
+        # `finally` tear down the HTTP server + adb reverse, so the download hit
+        # a dead port and the profile was silently never created (fetched=0,
+        # profiles list unchanged). Hold everything open until the device has
+        # actually pulled the bytes.
+        if saved:
+            for _ in range(60):                 # up to ~30s
+                if stats["hits"] > 0:
+                    break
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(2)              # let CMFA finish writing it out
         # Diagnostics: distinguish "reverse failed" / "device never fetched the
         # config" / "Save button never rendered" — these fail identically today.
         return {"ok": saved and stats["hits"] > 0, "saved": saved,
