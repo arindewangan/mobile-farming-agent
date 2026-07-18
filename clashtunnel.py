@@ -413,6 +413,20 @@ async def disarm_lockdown(serial: str) -> dict:
     return {"ok": True}
 
 
+async def _drop_protection(serial: str) -> None:
+    """Fully tear down the VPN so a config import can actually download.
+
+    Clearing the always-on settings alone is NOT enough: an already-established
+    always-on session keeps its lockdown routing in place, which still blocks
+    CMFA's own config fetch (the import then reports fetched=0 and imports
+    nothing). Force-stopping the app kills the VpnService for real — safe only
+    AFTER always_on_vpn_app is cleared, otherwise Android just respawns it."""
+    await disarm_lockdown(serial)
+    await stop(serial)
+    await adb.shell(serial, f"am force-stop {PKG}")
+    await asyncio.sleep(5)
+
+
 # --------------------------------------------------------------------------- #
 # high-level operations
 # --------------------------------------------------------------------------- #
@@ -433,9 +447,7 @@ async def set_proxy(serial: str, proxy: dict, retries: int = 2) -> dict:
     # for the import, then restore it.
     was_armed = await is_lockdown_armed(serial)
     if was_armed:
-        await disarm_lockdown(serial)
-        await stop(serial)
-        await asyncio.sleep(2)
+        await _drop_protection(serial)
     exit_info: dict = {}
     try:
         pname = _unique_profile_name()
@@ -474,9 +486,7 @@ async def onboard(serial: str, proxy: dict) -> dict:
     # blocks CMFA's config download exactly as in set_proxy — so drop it first.
     # (arm_lockdown below re-arms it as part of the normal flow.)
     if await is_lockdown_armed(serial):
-        await disarm_lockdown(serial)
-        await stop(serial)
-        await asyncio.sleep(2)
+        await _drop_protection(serial)
     pname = _unique_profile_name()
     imp = await import_profile(serial, gen_config(proxy), profile_name=pname)
     await select_profile(serial, pname)
