@@ -330,6 +330,15 @@ async def select_profile(serial: str, name: str = PROFILE_NAME) -> bool:
         return False
     await adb.tap(serial, *_center(b))                # -> ProfilesActivity
     await asyncio.sleep(2)
+    # Every proxy switch imports ANOTHER profile, so this list only grows — the
+    # profile we just imported is often below the fold, where a single
+    # screen-dump can't see it (import succeeds, selection silently fails, and
+    # the device keeps its old exit). Scroll until it comes into view.
+    for _ in range(8):
+        if _profile_radio(await _dump_ui(serial), name) is not None:
+            break
+        await adb.swipe(serial, 540, 1500, 540, 500, 300)
+        await asyncio.sleep(1.2)
     for _ in range(4):
         r = _profile_radio(await _dump_ui(serial), name)
         if r is None:
