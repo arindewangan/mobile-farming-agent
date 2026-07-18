@@ -425,23 +425,41 @@ async def set_proxy(serial: str, proxy: dict, retries: int = 2) -> dict:
     hopeful assumption."""
     if not await is_installed(serial):
         return {"ok": False, "error": "clash not installed — run onboard first"}
-    pname = _unique_profile_name()
-    imp = await import_profile(serial, gen_config(proxy), profile_name=pname)
-    selected = await select_profile(serial, pname)   # activate the fresh profile
-    for attempt in range(retries + 1):
+    # Android's always-on-VPN lockdown blocks CMFA's OWN config download, so an
+    # import on an already-protected device fetches nothing (fetched=0) and
+    # silently keeps the previous profile — which is why every proxy switch was
+    # a no-op and half the fleet stayed stranded on dead exits. onboard only
+    # worked because it imports BEFORE it arms the kill-switch. Drop lockdown
+    # for the import, then restore it.
+    was_armed = await is_lockdown_armed(serial)
+    if was_armed:
+        await disarm_lockdown(serial)
         await stop(serial)
-        await asyncio.sleep(1.5)
-        await start(serial)
-        await asyncio.sleep(5)
-        exit_info = await verify_exit(serial)
-        if exit_info.get("ip") == proxy["host"]:
-            return {"ok": True, "connected": True, "exit": exit_info,
-                    "import": imp, "selected": selected,
-                    "lockdown": await is_lockdown_armed(serial)}
-        selected = await select_profile(serial, pname)  # self-correct a missed selection
-    return {"ok": False, "connected": False, "exit": exit_info,
-            "expected": proxy["host"], "import": imp, "selected": selected,
-            "error": "exit IP did not match proxy (profile not active?)"}
+        await asyncio.sleep(2)
+    exit_info: dict = {}
+    try:
+        pname = _unique_profile_name()
+        imp = await import_profile(serial, gen_config(proxy), profile_name=pname)
+        selected = await select_profile(serial, pname)   # activate the fresh profile
+        for attempt in range(retries + 1):
+            await stop(serial)
+            await asyncio.sleep(1.5)
+            await start(serial)
+            await asyncio.sleep(5)
+            exit_info = await verify_exit(serial)
+            if exit_info.get("ip") == proxy["host"]:
+                return {"ok": True, "connected": True, "exit": exit_info,
+                        "import": imp, "selected": selected, "relockdown": was_armed}
+            selected = await select_profile(serial, pname)  # self-correct a missed selection
+        return {"ok": False, "connected": False, "exit": exit_info,
+                "expected": proxy["host"], "import": imp, "selected": selected,
+                "relockdown": was_armed,
+                "error": "exit IP did not match proxy (profile not active?)"}
+    finally:
+        if was_armed:
+            # Re-arm without rebooting — the tunnel is already back up and the
+            # setting persists, so a later boot enforces the kill-switch again.
+            await arm_lockdown(serial, reboot=False)
 
 
 async def onboard(serial: str, proxy: dict) -> dict:
@@ -452,6 +470,13 @@ async def onboard(serial: str, proxy: dict) -> dict:
     inst = await install(serial)
     if not inst["ok"]:
         return inst
+    # A RE-onboard hits an already-locked-down device, where the kill-switch
+    # blocks CMFA's config download exactly as in set_proxy — so drop it first.
+    # (arm_lockdown below re-arms it as part of the normal flow.)
+    if await is_lockdown_armed(serial):
+        await disarm_lockdown(serial)
+        await stop(serial)
+        await asyncio.sleep(2)
     pname = _unique_profile_name()
     imp = await import_profile(serial, gen_config(proxy), profile_name=pname)
     await select_profile(serial, pname)
