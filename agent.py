@@ -801,15 +801,11 @@ class Agent:
                 result = await fingerprint_spoofer.rollback(serial)
             elif action == "fingerprint_status":
                 result = await fingerprint_spoofer.get_status(serial)
-            # ---- Google account sign-in/out ------------------------------------
-            elif action == "google_signin":
-                result = await googleaccounts.sign_in(
-                    serial, payload["email"], payload["password"],
-                    timeout=float(payload.get("timeout", 120)),
-                    vision_model=payload.get("vision_model"), recovery_model=payload.get("recovery_model"))
-            elif action == "google_signout":
-                result = await googleaccounts.sign_out(
-                    serial, payload.get("email"), timeout=float(payload.get("timeout", 60)))
+            # ---- Google accounts -------------------------------------------------
+            # google_signin/google_signout were removed: the backend never
+            # dispatched them (sign-in runs PC-side in signin_recovery.py, with
+            # the device only executing primitives). Reading the signed-in list
+            # is the one thing still asked for.
             elif action == "google_list_accounts":
                 result = await googleaccounts.list_accounts(serial)
             # ---- Play Store -----------------------------------------------------
