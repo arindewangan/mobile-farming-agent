@@ -383,6 +383,79 @@ def _profile_radio(xml: str, name: str) -> Optional[tuple[int, int, bool]]:
     return best
 
 
+async def _open_profiles(serial: str) -> bool:
+    """Navigate to ProfilesActivity (not exported, so go via MainActivity)."""
+    await adb.launch_package(serial, PKG)
+    await asyncio.sleep(2.5)
+    b = _find_bounds(await _dump_ui(serial), text="Profile")
+    if not b:
+        return False
+    await adb.tap(serial, *_center(b))
+    await asyncio.sleep(2)
+    return True
+
+
+def _profile_rows(xml: str) -> list[tuple[str, tuple[int, int]]]:
+    """(name, tap-point) for every profile row currently on screen."""
+    rows: list[tuple[str, tuple[int, int]]] = []
+    for node in re.findall(r"<node\b[^>]*?/>", xml):
+        if "TextView" not in node:
+            continue
+        m = re.search(r'text="(mf-[^"]*)"', node)
+        if not m:
+            continue
+        c = _center(re.search(r'bounds="(\[[^"]*\])"', node).group(1))
+        if c:
+            rows.append((m.group(1), c))
+    return rows
+
+
+async def prune_profiles(serial: str, keep: str, max_delete: int = 30) -> dict:
+    """Delete every saved profile except `keep`.
+
+    Each proxy switch imports a new profile, and CMFA never removes the old one.
+    After ~20 switches the list is long enough that the newly-imported profile
+    sits below the fold, select_profile can't reach it, and EVERY further
+    re-point silently fails with "exit IP did not match proxy" — the device is
+    then stuck on whatever proxy it had, permanently. Observed on real devices
+    at 22 profiles.
+
+    Best-effort UI automation (CMFA offers no intent for this): long-press a row
+    → tap Delete → confirm. Any step that can't find its target ends the pass
+    rather than blind-tapping, and a failure here never fails the switch — a
+    cluttered list is a slow problem, a mis-tap is an immediate one.
+    """
+    deleted, attempts = 0, 0
+    if not await _open_profiles(serial):
+        return {"ok": False, "deleted": 0, "error": "could not open profiles"}
+    while attempts < max_delete:
+        attempts += 1
+        rows = [r for r in _profile_rows(await _dump_ui(serial)) if r[0] != keep]
+        if not rows:
+            break
+        name, (x, y) = rows[0]
+        await adb.shell(serial, f"input swipe {x} {y} {x} {y} 900")   # long-press
+        await asyncio.sleep(1.2)
+        xml = await _dump_ui(serial)
+        target = (_find_bounds(xml, text="Delete") or _find_bounds(xml, desc="Delete")
+                  or _find_bounds(xml, text="Remove") or _find_bounds(xml, desc="Remove"))
+        if not target:
+            await adb.keyevent(serial, "KEYCODE_BACK")   # no menu — don't guess
+            break
+        await adb.tap(serial, *_center(target))
+        await asyncio.sleep(1.0)
+        # confirmation dialog, if this build shows one
+        xml = await _dump_ui(serial)
+        for label in ("DELETE", "Delete", "OK", "Yes"):
+            b = _find_bounds(xml, text=label)
+            if b:
+                await adb.tap(serial, *_center(b))
+                break
+        await asyncio.sleep(1.2)
+        deleted += 1
+    return {"ok": True, "deleted": deleted, "kept": keep}
+
+
 async def select_profile(serial: str, name: str = PROFILE_NAME) -> bool:
     """Activate the named profile. ProfilesActivity is NOT exported (am start on
     it throws SecurityException), so reach it through MainActivity's 'Profile'
@@ -534,8 +607,17 @@ async def set_proxy(serial: str, proxy: dict, retries: int = 2) -> dict:
             await asyncio.sleep(5)
             exit_info = await verify_exit(serial)
             if exit_info.get("ip") == proxy["host"]:
+                # Switch is confirmed working — now clear the old profiles so the
+                # list can't grow until select_profile stops being able to reach
+                # the newest entry. Best-effort: never let cleanup fail a switch.
+                pruned = None
+                try:
+                    pruned = await prune_profiles(serial, keep=pname)
+                except Exception:  # noqa: BLE001
+                    pruned = {"ok": False}
                 return {"ok": True, "connected": True, "exit": exit_info,
-                        "import": imp, "selected": selected, "relockdown": was_armed}
+                        "import": imp, "selected": selected, "relockdown": was_armed,
+                        "pruned": pruned}
             selected = await select_profile(serial, pname)  # self-correct a missed selection
         return {"ok": False, "connected": False, "exit": exit_info,
                 "expected": proxy["host"], "import": imp, "selected": selected,

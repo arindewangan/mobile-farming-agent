@@ -132,7 +132,13 @@ class Agent:
         # scrcpy control server = instant rootless input (primary touch path)
         self.scrcpy: dict[str, scrcpycontrol.ScrcpyControl] = {}
         self._scrcpy_deployed: set[str] = set()
-        self._scrcpy_unavailable: set[str] = set()
+        # serial -> (retry_after_epoch, reason). NOT a permanent set: scrcpy can
+        # fail for transient reasons (device mid-reboot, a busy USB bus, a port
+        # collision), and a sticky blacklist meant one blip disabled YouTube and
+        # every other scrcpy-driven flow on that device until the agent process
+        # was restarted — the "scrcpy control unavailable for youtube" errors.
+        self._scrcpy_unavailable: dict[str, tuple[float, str]] = {}
+        self._scrcpy_retry_s = 300.0
         self._scrcpy_start_lock = asyncio.Lock()
         # Per-device ordered input pipeline (preserves gesture event order).
         self._input_queues: dict[str, asyncio.Queue] = {}
@@ -483,13 +489,15 @@ class Agent:
         c = self.scrcpy.get(serial)
         if c is not None:
             return c
-        if serial in self._scrcpy_unavailable or not scrcpycontrol.available():
+        if not scrcpycontrol.available():
+            return None
+        if self._scrcpy_blocked(serial):
             return None
         async with self._scrcpy_start_lock:
             c = self.scrcpy.get(serial)
             if c is not None:
                 return c
-            if serial in self._scrcpy_unavailable:
+            if self._scrcpy_blocked(serial):
                 return None
             info = self.devices.get(serial, {})
             try:
@@ -508,9 +516,28 @@ class Agent:
                         await c.stop()  # kill the already-spawned on-device server + forward
                     except Exception:  # noqa: BLE001
                         pass
-                self._scrcpy_unavailable.add(serial)
-                print(f"[scrcpy {serial}] unavailable ({e}); using adb input", file=sys.stderr)
+                self._scrcpy_mark_unavailable(serial, str(e))
+                print(f"[scrcpy {serial}] unavailable ({e}); retrying in {int(self._scrcpy_retry_s)}s, using adb input", file=sys.stderr)
                 return None
+
+    def _scrcpy_blocked(self, serial: str) -> bool:
+        """Is this device still inside its scrcpy back-off window?"""
+        entry = self._scrcpy_unavailable.get(serial)
+        if not entry:
+            return False
+        if time.time() >= entry[0]:
+            del self._scrcpy_unavailable[serial]   # cooldown expired — allow a retry
+            return False
+        return True
+
+    def _scrcpy_mark_unavailable(self, serial: str, reason: str = "") -> None:
+        self._scrcpy_unavailable[serial] = (time.time() + self._scrcpy_retry_s, reason[:120])
+
+    def scrcpy_unavailable_reason(self, serial: str) -> str:
+        entry = self._scrcpy_unavailable.get(serial)
+        if not entry:
+            return "scrcpy could not be started"
+        return f"{entry[1] or 'scrcpy could not be started'} (retrying in {max(0, int(entry[0] - time.time()))}s)"
 
     async def _drop_scrcpy(self, serial: str) -> None:
         c = self.scrcpy.pop(serial, None)
@@ -525,7 +552,7 @@ class Agent:
                 return
             except Exception as e:  # noqa: BLE001
                 print(f"[scrcpy {serial}] tap fail ({e}); adb", file=sys.stderr)
-                self._scrcpy_unavailable.add(serial)
+                self._scrcpy_mark_unavailable(serial, 'input path failed')
                 await self._drop_scrcpy(serial)
         await self._input_shell(serial).tap(x, y)
 
@@ -537,7 +564,7 @@ class Agent:
                 return
             except Exception as e:  # noqa: BLE001
                 print(f"[scrcpy {serial}] swipe fail ({e}); adb", file=sys.stderr)
-                self._scrcpy_unavailable.add(serial)
+                self._scrcpy_mark_unavailable(serial, 'input path failed')
                 await self._drop_scrcpy(serial)
         await self._input_shell(serial).swipe(x1, y1, x2, y2)
 
@@ -643,7 +670,7 @@ class Agent:
                 return
             except Exception as e:  # noqa: BLE001
                 print(f"[scrcpy {serial}] touch fail ({e}); adb", file=sys.stderr)
-                self._scrcpy_unavailable.add(serial)
+                self._scrcpy_mark_unavailable(serial, 'input path failed')
                 await self._drop_scrcpy(serial)
                 # fall through to the adb gesture path
 
@@ -683,7 +710,7 @@ class Agent:
                 return
             except Exception as e:  # noqa: BLE001
                 print(f"[scrcpy {serial}] long_press fail ({e}); adb", file=sys.stderr)
-                self._scrcpy_unavailable.add(serial)
+                self._scrcpy_mark_unavailable(serial, 'input path failed')
                 await self._drop_scrcpy(serial)
         await self._input_shell(serial).swipe(x, y, x, y, dur_ms)
 
@@ -729,7 +756,7 @@ class Agent:
             elif action == "human_scroll":
                 ctrl = await self._ensure_scrcpy(serial)
                 if ctrl is None:
-                    result = {"ok": False, "error": "scrcpy control unavailable for human_scroll"}
+                    result = {"ok": False, "error": f"scrcpy control unavailable for human_scroll: {self.scrcpy_unavailable_reason(serial)}"}
                 else:
                     await humanize.human_scroll(ctrl, ctrl.width, ctrl.height,
                                                 direction=payload.get("direction", "up"),
@@ -738,7 +765,7 @@ class Agent:
             elif action == "watch_feed":
                 ctrl = await self._ensure_scrcpy(serial)
                 if ctrl is None:
-                    result = {"ok": False, "error": "scrcpy control unavailable for watch_feed"}
+                    result = {"ok": False, "error": f"scrcpy control unavailable for watch_feed: {self.scrcpy_unavailable_reason(serial)}"}
                 else:
                     result = await humanize.watch_feed(
                         ctrl, ctrl.width, ctrl.height,
@@ -750,7 +777,7 @@ class Agent:
                 # Human-like YouTube flows (watch by link / search / channel / shorts).
                 ctrl = await self._ensure_scrcpy(serial)
                 if ctrl is None:
-                    result = {"ok": False, "error": "scrcpy control unavailable for youtube"}
+                    result = {"ok": False, "error": f"scrcpy control unavailable for youtube: {self.scrcpy_unavailable_reason(serial)}"}
                 else:
                     result = await youtube.run(serial, ctrl, payload)
             elif action == "key":
@@ -845,6 +872,12 @@ class Agent:
                 result = await clashtunnel.verify_exit(serial)
             elif action == "tunnel_status":
                 result = await clashtunnel.status(serial)
+            elif action == "tunnel_prune_profiles":
+                # Delete stale Clash profiles, keeping the active one. Needed on
+                # devices that accumulated profiles before pruning existed —
+                # once the list outgrows one screen, no proxy switch can work.
+                result = await clashtunnel.prune_profiles(
+                    serial, keep=payload.get("keep") or "", max_delete=int(payload.get("max", 30)))
             elif action == "tunnel_heal":
                 # revive a fail-closed device (core died) without a reboot
                 async with self._serial_lock(self._tunnel_locks, serial):
