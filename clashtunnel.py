@@ -424,16 +424,29 @@ async def prune_profiles(serial: str, keep: str, max_delete: int = 30) -> dict:
     → tap Delete → confirm. Any step that can't find its target ends the pass
     rather than blind-tapping, and a failure here never fails the switch — a
     cluttered list is a slow problem, a mis-tap is an immediate one.
+
+    KNOWN LIMITATION: on the CMFA builds this fleet runs, long-pressing a
+    profile row opens no menu at all — only "Close" and "New" exist — so this
+    deletes nothing and reports deleted=0 with a reason. It is kept because the
+    gesture is harmless and a future build may add the menu, but do not treat a
+    successful call as evidence the list was pruned.
+
+    The remedy that does work is a full reset of the app:
+        adb shell pm clear com.github.metacubex.clash.meta
+        adb shell appops set com.github.metacubex.clash.meta ACTIVATE_VPN allow
+    followed by a fresh onboard. Disable the tunnel first — clearing the app
+    while the always-on lockdown is armed strands the device with no route.
     """
     deleted, attempts = 0, 0
+    no_menu = False
     if not await _open_profiles(serial):
         return {"ok": False, "deleted": 0, "error": "could not open profiles"}
     while attempts < max_delete:
         attempts += 1
-        rows = [r for r in _profile_rows(await _dump_ui(serial)) if r[0] != keep]
-        if not rows:
+        before = [r for r in _profile_rows(await _dump_ui(serial)) if r[0] != keep]
+        if not before:
             break
-        name, (x, y) = rows[0]
+        name, (x, y) = before[0]
         await adb.shell(serial, f"input swipe {x} {y} {x} {y} 900")   # long-press
         await asyncio.sleep(1.2)
         xml = await _dump_ui(serial)
@@ -441,6 +454,7 @@ async def prune_profiles(serial: str, keep: str, max_delete: int = 30) -> dict:
                   or _find_bounds(xml, text="Remove") or _find_bounds(xml, desc="Remove"))
         if not target:
             await adb.keyevent(serial, "KEYCODE_BACK")   # no menu — don't guess
+            no_menu = True
             break
         await adb.tap(serial, *_center(target))
         await asyncio.sleep(1.0)
@@ -452,8 +466,19 @@ async def prune_profiles(serial: str, keep: str, max_delete: int = 30) -> dict:
                 await adb.tap(serial, *_center(b))
                 break
         await asyncio.sleep(1.2)
+        # Confirm the row actually went. Counting the attempt instead of the
+        # result is how this came to report "deleted: 22" for a device whose
+        # list never changed, which sent a real investigation the wrong way.
+        after = [r[0] for r in _profile_rows(await _dump_ui(serial)) if r[0] != keep]
+        if name in after:
+            no_menu = True          # tapped something, nothing was removed
+            break
         deleted += 1
-    return {"ok": True, "deleted": deleted, "kept": keep}
+    out = {"ok": deleted > 0 or not no_menu, "deleted": deleted, "kept": keep}
+    if no_menu:
+        out["error"] = ("this CMFA build exposes no delete action on a profile row — "
+                        "pm clear + re-onboard is the working reset")
+    return out
 
 
 async def select_profile(serial: str, name: str = PROFILE_NAME) -> bool:
