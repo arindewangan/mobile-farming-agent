@@ -470,6 +470,35 @@ async def _reach(serial: str, ctrl, bh: Behavior, *expect: str, goal: str = "", 
     return await _recover(serial, ctrl, bh, st, *expect, goal=goal)
 
 
+async def _await_content(serial: str, bh: Behavior, probes: list[str], timeout: float = 20.0) -> bool:
+    """Wait for a list to actually contain rows, rather than sleeping and hoping.
+
+    Screen chrome — a nav bar, a search box, a channel header — renders the
+    moment an activity is up, before a single row of content has arrived. On a
+    warm app that gap is imperceptible, which is why a fixed `pause(1.5, 3.0)`
+    looked sufficient. On a cold start behind a proxy it is several seconds,
+    and a flow that starts tapping inside that window finds nothing to tap,
+    wanders, and reports "unexpected screen" from wherever it ended up. That is
+    what made channel_watch fail 3/4 right after a restore_defaults (which
+    force-stops YouTube) while warm devices passed 3/4 on the same recipe.
+
+    `probes` should be the markers the NEXT step actually needs — cell_probes
+    for a video list, channel_open for channel rows — so "content is here"
+    means the thing the flow is about to use, not merely that pixels changed.
+
+    Returns whether content arrived. Callers proceed either way: an empty list
+    is the flow's own recovery problem, and refusing to continue would turn a
+    slow network into a hard failure.
+    """
+    deadline = _now() + timeout
+    while _now() < deadline:
+        m = await _ui(serial, *probes)
+        if any(m.get(q, {}).get("present") for q in probes):
+            return True
+        await bh.pause(0.5, 1.0)
+    return False
+
+
 # ------------------------------------------------------ human app open/close --
 async def _open_app(serial: str, ctrl, bh: Behavior) -> dict:
     """Open YouTube to a clean Home feed (force-restart so we don't resume a prior
@@ -482,6 +511,9 @@ async def _open_app(serial: str, ctrl, bh: Behavior) -> dict:
     st = await _ensure(serial, ctrl, bh, *bh.sel("home_markers"), timeout=25)
     if not st["ok"]:
         return st
+    # Chrome is up; the feed may not be. Costs a warm device one UI read.
+    if not await _await_content(serial, bh, bh.sel("cell_probes"), timeout=o.get("feed_timeout_s", 20.0)):
+        _log(serial, "home feed still empty after wait — continuing, expect a rough pick")
     await _set_orientation(serial, bh.orientation)
     await asyncio.sleep(bh.think(300))
     if bh.roll(o.get("glance_prob", 0.35)):        # glance at the feed like a person
@@ -982,12 +1014,20 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     await _set_orientation(serial, bh.orientation)
     await bh.pause(1.5, 3.0)
     if not direct:
+        # This tap is POSITIONAL, so it must not happen until the channel rows
+        # are actually rendered — otherwise it lands on an empty list and the
+        # flow proceeds believing it opened a channel.
+        if not await _await_content(serial, bh, bh.sel("channel_open"), timeout=15.0):
+            _log(serial, "channel results still empty — tapping the first row anyway")
         # tap the first channel row (top of the channel-filtered results), positional
         await _click(serial, ctrl.width * random.uniform(0.25, 0.45), ctrl.height * random.uniform(0.24, 0.32))
         await bh.pause(1.5, 3.0)
     # open the requested tab, then browse + pick a video
     await _find_and_tap(serial, ctrl, tab, tab.upper(), ocr=True)
     await bh.pause(0.9, 2.0)
+    # The tab switch repopulates the list; wait for real cells before scrolling
+    # and picking, so a cold load doesn't send the picker at an empty page.
+    await _await_content(serial, bh, bh.sel("cell_probes"), timeout=15.0)
     await humanize.human_scroll(ctrl, ctrl.width, ctrl.height, "up", random.uniform(0.25, 0.7))
     await bh.pause(0.6, 1.8)
     on_watch = await _pick_result(serial, ctrl, bh)
