@@ -51,6 +51,38 @@ def _log(serial: str, msg: str) -> None:
     print(f"[yt {serial[:10]}] {msg}", file=sys.stderr, flush=True)
 
 
+# ── Checkpoints ──────────────────────────────────────────────────────────────
+# The flows already guard themselves: _ensure waits for expected markers and
+# gives up with "unexpected screen". What that could never say is HOW FAR the
+# flow got. A run log reading "screen changed — manual fix required: unexpected
+# screen" is the same text whether YouTube never opened, the channel page never
+# loaded, or playback failed after everything else worked — three different
+# problems with three different fixes, reported identically.
+#
+# So each flow now marks named stages as it passes them, and every failure
+# carries the trail. "opened → channel loaded" followed by a failure says the
+# video never started; no marks at all says YouTube never came up.
+#
+# Deliberately just strings appended to a per-serial list: this runs on the Pi,
+# where the compute-split rule keeps everything cheap. No model, no screenshot,
+# no extra ADB round trip — a checkpoint costs one list append.
+_checkpoints: dict[str, list[str]] = {}
+
+
+def _cp_reset(serial: str) -> None:
+    _checkpoints[serial] = []
+
+
+def _cp(serial: str, name: str) -> None:
+    """Mark a stage as reached."""
+    _checkpoints.setdefault(serial, []).append(name)
+    _log(serial, f"✓ {name}")
+
+
+def _cp_trail(serial: str) -> list[str]:
+    return list(_checkpoints.get(serial, []))
+
+
 PKG = "com.google.android.youtube"
 _GOOGLE_PKGS = {"com.google.android.gms", "com.google.android.gsf",
                 "com.android.vending", "com.google.android.googlequicksearchbox"}
@@ -415,12 +447,19 @@ async def _visible_texts(serial: str) -> list[str]:
     return st.get("texts", [])[:12]
 
 
-def _abort(flow: str, st: dict) -> dict:
+def _abort(flow: str, st: dict, serial: str | None = None) -> dict:
     reason = st.get("reason") or st.get("status") or "unexpected screen"
     blocked = st.get("status") == "blocked" or st.get("quarantine")
+    trail = _cp_trail(serial) if serial else []
+    # Put the trail IN the reason, not just alongside it: the backend surfaces
+    # `reason` in the run log, and a field nobody reads helps nobody.
+    if trail:
+        reason = f"{reason} (reached: {' → '.join(trail)})"
+    elif serial:
+        reason = f"{reason} (no stage reached — the app never came up)"
     return {
         "ok": False, "flow": flow, "status": st.get("status", "unknown"),
-        "manual": True, "reason": reason,
+        "manual": True, "reason": reason, "checkpoints": trail,
         "quarantine": bool(blocked),
         "state": st.get("state") or ("blocked" if blocked else None),
         "detail": (f"account blocked — quarantined: {reason}" if blocked
@@ -989,6 +1028,7 @@ async def search_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
 
 async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     _log(serial, "channel_watch start")
+    _cp_reset(serial)
     channel = str(p.get("channel") or p.get("query") or "").strip()
     if not channel:
         return _abort("channel_watch", {"status": "unknown", "reason": "no channel given"})
@@ -1010,7 +1050,8 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         await _open_url(serial, _yt_search_url(channel.lstrip("@"), "EgIQAg%3D%3D"))
     on = await _await_online(serial, ctrl, bh, timeout=25)
     if not on["ok"]:
-        return _abort("channel_watch", on)
+        return _abort("channel_watch", on, serial)
+    _cp(serial, "youtube opened")
     await _set_orientation(serial, bh.orientation)
     await bh.pause(1.5, 3.0)
     if not direct:
@@ -1030,6 +1071,7 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     await _await_content(serial, bh, bh.sel("cell_probes"), timeout=15.0)
     await humanize.human_scroll(ctrl, ctrl.width, ctrl.height, "up", random.uniform(0.25, 0.7))
     await bh.pause(0.6, 1.8)
+    _cp(serial, "channel page reached")
     on_watch = await _pick_result(serial, ctrl, bh)
     if not on_watch and not bh.expired():
         # A channel page often opens on a non-list state first (a pinned/loading
@@ -1044,11 +1086,14 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         st = await _reach(serial, ctrl, bh, *bh.sel("watch_markers"),
                           goal="You are on a YouTube channel. Open one of the channel's videos so it plays.", timeout=20)
         if not st["ok"]:
-            return _abort("channel_watch", st)
+            return _abort("channel_watch", st, serial)
+    _cp(serial, "video opened")
     res = await _watch_video(serial, ctrl, bh, _watch_s_pick(p.get("watch_s", 90)))
+    _cp(serial, "watched")
     await _close_app(serial, ctrl, bh)
     _log(serial, f"done: watched {res.get('watched_s')}s")
-    return {"ok": True, "flow": "channel_watch", "channel": channel, "opened_video": on_watch, **res}
+    return {"ok": True, "flow": "channel_watch", "channel": channel,
+            "opened_video": on_watch, "checkpoints": _cp_trail(serial), **res}
 
 
 async def channel_binge(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
