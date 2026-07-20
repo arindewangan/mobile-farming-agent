@@ -984,6 +984,12 @@ async def watch_link(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     _cp(serial, "watched")
     chained = await _maybe_chain(serial, ctrl, bh)
     await _close_app(serial, ctrl, bh)
+    watched = float(res.get("watched_s") or 0)
+    if watched <= 0:
+        _log(serial, "FAILED: opened the link but nothing played")
+        return _abort("watch_link",
+                      {"status": "no_playback", "reason": "opened the link but nothing played"},
+                      serial)
     return {"ok": True, "flow": "watch_link", "url": url, "chained": chained,
             "checkpoints": _cp_trail(serial), **res}
 
@@ -1029,6 +1035,12 @@ async def search_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     chained = await _maybe_chain(serial, ctrl, bh)
     await _close_app(serial, ctrl, bh)
     _log(serial, f"done: watched {res.get('watched_s')}s ({res.get('actions')}) chained={chained}")
+    watched = float(res.get("watched_s") or 0)
+    if not (on_watch and watched > 0):
+        why = ("never opened a video from the results" if not on_watch
+               else f"opened a video but watched {watched:g}s")
+        _log(serial, f"FAILED: {why}")
+        return _abort("search_watch", {"status": "no_playback", "reason": why}, serial)
     return {"ok": True, "flow": "search_watch", "query": query, "opened_video": on_watch,
             "chained": chained, "checkpoints": _cp_trail(serial), **res}
 
@@ -1098,7 +1110,23 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     res = await _watch_video(serial, ctrl, bh, _watch_s_pick(p.get("watch_s", 90)))
     _cp(serial, "watched")
     await _close_app(serial, ctrl, bh)
-    _log(serial, f"done: watched {res.get('watched_s')}s")
+
+    # ok reflects whether a video ACTUALLY played, not whether the function
+    # reached its end. This used to be an unconditional True: when
+    # _pick_result found nothing and the _reach recovery merely believed it was
+    # on a watch page, _watch_video would idle against a static screen for the
+    # full duration and the flow reported success. That is the "it opens the
+    # channel and then does nothing" failure — reported as a green tick, which
+    # is worse than failing, because nobody goes looking.
+    watched = float(res.get("watched_s") or 0)
+    played = bool(on_watch) and watched > 0
+    if not played:
+        why = ("never opened a video from the channel page"
+               if not on_watch else f"opened a video but watched {watched:g}s")
+        _log(serial, f"FAILED: {why}")
+        return _abort("channel_watch", {"status": "no_playback", "reason": why}, serial)
+
+    _log(serial, f"done: watched {watched:g}s")
     return {"ok": True, "flow": "channel_watch", "channel": channel,
             "opened_video": on_watch, "checkpoints": _cp_trail(serial), **res}
 
@@ -1252,7 +1280,14 @@ async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         await bh.pause(0.4, 1.8)
 
     await _close_app(serial, ctrl, bh)
+    # Zero shorts swiped means the reel never came up — the loop simply never
+    # ran. Reporting that as success is the same lie as channel_watch's.
+    if watched <= 0:
+        _log(serial, "FAILED: no shorts were watched")
+        return _abort("shorts", {"status": "no_playback", "reason": "no shorts were watched"},
+                      serial)
     return {"ok": True, "flow": "shorts", "watched": watched, "liked": liked,
+            "checkpoints": _cp_trail(serial),
             "duration_s": round(_now() - start, 1), "channel": channel}
 
 
