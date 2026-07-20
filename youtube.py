@@ -1293,7 +1293,20 @@ async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
 
 def _watch_s_pick(spec) -> float:
     """A single-video watch time from either a fixed number or a [min,max] range
-    (so each video in a session gets its own varied duration)."""
+    (so each video in a session gets its own varied duration).
+
+    Also accepts "min,max" as a STRING. Recipe variables substitute as text, so
+    a {{watch_s}} of "15,30" arrives here as a string and used to raise
+    ValueError mid-flow — the run died on a value the UI had happily accepted.
+    Parsing it here keeps the failure out of the operator's way rather than
+    forcing every recipe author to know the internal type.
+    """
+    if isinstance(spec, str) and "," in spec:
+        try:
+            lo, hi = (float(x.strip()) for x in spec.split(",", 1))
+            spec = [lo, hi]
+        except ValueError:
+            pass          # fall through to the numeric path, which reports it
     if isinstance(spec, (list, tuple)) and len(spec) == 2:
         return random.uniform(float(spec[0]), float(spec[1]))
     return float(spec or 120)
