@@ -962,6 +962,7 @@ async def _tap_first_suggestion(serial: str, ctrl, bh: Behavior) -> bool:
 
 # --------------------------------------------------------------- flows -------
 async def watch_link(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    _cp_reset(serial)
     url = str(p["url"]).strip()
     watch_s = _watch_s_pick(p.get("watch_s", 90))   # accepts a fixed number OR a [min,max] range
     await _set_orientation(serial, bh.orientation)
@@ -976,12 +977,15 @@ async def watch_link(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
                       goal="You are in the YouTube app. Make sure the video is open and playing on the watch page.",
                       timeout=22)
     if not st["ok"]:
-        return _abort("watch_link", st)
+        return _abort("watch_link", st, serial)
     await _set_orientation(serial, bh.orientation)
+    _cp(serial, "video opened")
     res = await _watch_video(serial, ctrl, bh, watch_s, allow_boredom=False)
+    _cp(serial, "watched")
     chained = await _maybe_chain(serial, ctrl, bh)
     await _close_app(serial, ctrl, bh)
-    return {"ok": True, "flow": "watch_link", "url": url, "chained": chained, **res}
+    return {"ok": True, "flow": "watch_link", "url": url, "chained": chained,
+            "checkpoints": _cp_trail(serial), **res}
 
 
 async def _wait_yt_chooser(serial: str, ctrl, bh: Behavior) -> bool:
@@ -996,6 +1000,7 @@ async def _wait_yt_chooser(serial: str, ctrl, bh: Behavior) -> bool:
 
 
 async def search_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    _cp_reset(serial)
     _log(serial, f"search_watch start (behavior={bh.style})")
     query = str(p["query"])
     sort = str(p.get("sort", "") or "")   # ""=relevance, "date","viewcount","rating"
@@ -1007,7 +1012,8 @@ async def search_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     await _open_url(serial, _yt_search_url(query, sp))
     on = await _await_online(serial, ctrl, bh, timeout=25)
     if not on["ok"]:
-        return _abort("search_watch", on)
+        return _abort("search_watch", on, serial)
+    _cp(serial, "youtube opened")
     await _set_orientation(serial, bh.orientation)
     await bh.pause(1.4, 3.0)                 # let cards render
     await asyncio.sleep(bh.think(400))       # a human scans the results
@@ -1017,13 +1023,14 @@ async def search_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         st = await _reach(serial, ctrl, bh, *bh.sel("watch_markers"),
                           goal="You are on a YouTube search results page. Open a video so it plays.", timeout=15)
         if not st["ok"]:
-            return _abort("search_watch", st)
+            return _abort("search_watch", st, serial)
     _log(serial, "watching")
     res = await _watch_video(serial, ctrl, bh, _watch_s_pick(p.get("watch_s", 90)))
     chained = await _maybe_chain(serial, ctrl, bh)
     await _close_app(serial, ctrl, bh)
     _log(serial, f"done: watched {res.get('watched_s')}s ({res.get('actions')}) chained={chained}")
-    return {"ok": True, "flow": "search_watch", "query": query, "opened_video": on_watch, "chained": chained, **res}
+    return {"ok": True, "flow": "search_watch", "query": query, "opened_video": on_watch,
+            "chained": chained, "checkpoints": _cp_trail(serial), **res}
 
 
 async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
@@ -1097,6 +1104,7 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
 
 
 async def channel_binge(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    _cp_reset(serial)
     """Watch several of ONE channel's videos IN ORDER, navigating its Videos tab in
     place: open the channel once, then watch → back → advance down the list → watch
     the next. Progresses through the tab's order (newest first) rather than
@@ -1119,7 +1127,8 @@ async def channel_binge(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     await _open_url(serial, _channel_url(channel) if direct else _yt_search_url(channel.lstrip("@"), "EgIQAg%3D%3D"))
     on = await _await_online(serial, ctrl, bh, timeout=25)
     if not on["ok"]:
-        return _abort("channel_binge", on)
+        return _abort("channel_binge", on, serial)
+    _cp(serial, "youtube opened")
     await _set_orientation(serial, bh.orientation)
     await bh.pause(1.5, 3.0)
     if not direct:                                   # a plain name → tap the top channel row
@@ -1160,6 +1169,7 @@ async def channel_binge(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
 
 
 async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    _cp_reset(serial)
     _log(serial, "shorts start")
     duration_s = float(p.get("duration_s", 120))
     channel = (p.get("channel") or "").strip() or None
@@ -1173,12 +1183,12 @@ async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         await _open_url(serial, f"https://www.youtube.com/shorts/{quote(short_id, safe='')}")
         on = await _await_online(serial, ctrl, bh, timeout=25)
         if not on["ok"]:
-            return _abort("shorts", on)
+            return _abort("shorts", on, serial)
     elif channel:                                   # a channel's Shorts grid
         await _open_url(serial, _channel_url(channel))
         on = await _await_online(serial, ctrl, bh, timeout=25)
         if not on["ok"]:
-            return _abort("shorts", on)
+            return _abort("shorts", on, serial)
         await bh.pause(1.5, 3.0)
         await _find_and_tap(serial, ctrl, *bh.sel("channel_shorts_tab"), ocr=True)
         await bh.pause(1.0, 2.0)
@@ -1190,14 +1200,14 @@ async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         await _open_url(serial, "https://www.youtube.com/shorts")
         on = await _await_online(serial, ctrl, bh, timeout=25)
         if not on["ok"]:
-            return _abort("shorts", on)
+            return _abort("shorts", on, serial)
 
     await _force_portrait(serial, bh)
     st = await _reach(serial, ctrl, bh, "reel_watch_player", "reel_recycler", "id/reel_time_bar",
                       *bh.sel("shorts_markers"),
                       goal="Open YouTube Shorts and start playing a short video.", timeout=16)
     if not st["ok"]:
-        return _abort("shorts", st)
+        return _abort("shorts", st, serial)
 
     seg_r = bh.prof["shorts"].get("segment_s", [5.0, 30.0])
     short_r = bh.prof["shorts"].get("short_frac_s", [1.5, 5.0])
@@ -1255,6 +1265,7 @@ def _watch_s_pick(spec) -> float:
 
 
 async def session(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    _cp_reset(serial)
     """Watch a SESSION of many videos in a chosen pattern, reusing the single-video
     flows so every video keeps the full human behaviour (pause/resume/skip/like,
     varied watch time, boredom). Stops at ``count`` videos or the ``max_run_s``
