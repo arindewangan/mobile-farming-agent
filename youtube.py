@@ -1667,8 +1667,12 @@ async def watch_ids(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         res = await _watch_video(serial, ctrl, bh, _watch_s_pick(ws))
         secs = float(res.get("watched_s") or 0)
         still = await _is_playing(serial)
+        # Carry the ad actions through. Without them the run log cannot answer
+        # "did it hit an ad, and did it get past it" — which is the whole point
+        # of the ad handling, and is invisible in a bare watch time.
+        acts = [a for a in (res.get("actions") or []) if "ad" in a.lower()]
         watched.append({"n": i, "id": vid, "ok": secs > 0, "watched_s": secs,
-                        "playing_at_end": still})
+                        "playing_at_end": still, "ads": acts})
         _cp(serial, f"video {i}/{len(ids)} watched {secs:g}s")
         _log(serial, f"{i}/{len(ids)} {vid}: {secs:g}s")
 
