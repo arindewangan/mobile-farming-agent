@@ -104,6 +104,42 @@ class TestWaitBudget:
         assert calls["n"] == 0, "content already present must not cost a single pause"
 
 
+class TestBlindPagesStopPayingForTheWait:
+    """Measured on the fleet: a device reported "list still empty" on all three
+    videos of a session while two of the three played — its results page simply
+    never exposes a11y cells, and the OCR/positional tiers carry it. Waiting the
+    full budget there is ~20s per video spent on something that cannot arrive.
+    """
+
+    def setup_method(self):
+        youtube._blind_pages.clear()
+
+    def test_the_short_circuit_is_bounded_and_shorter(self):
+        assert youtube._PICK_BLIND_WAIT_S < youtube._PICK_WAIT_S
+        assert youtube._BLIND_AFTER >= 2, \
+            "one miss is a slow page; only a repeat is evidence of a blind one"
+
+    def test_it_takes_repeated_misses_to_trip(self):
+        """A single slow load must not permanently downgrade the wait for a
+        device whose cells DO normally appear."""
+        src = _src()
+        assert "_BLIND_AFTER" in src and "_blind_pages" in src
+
+    def test_a_success_resets_the_counter(self):
+        """Otherwise a device that was briefly slow keeps the short wait
+        forever, quietly reintroducing the very race this fixes."""
+        src = _src()
+        assert "_blind_pages[serial] = 0" in src
+
+    def test_the_nudge_scroll_still_happens_when_blind(self):
+        """The scroll does double duty — it also moves past a promo header,
+        which is an independent reason the first pick misses."""
+        src = _src()
+        blind_branch = src.split("_blind_pages[serial] = _blind_pages.get", 1)[1]
+        assert "human_scroll" in blind_branch.split("if blind:", 1)[0], \
+            "the scroll must precede the blind short-circuit, not be skipped by it"
+
+
 class TestCheckpointTellsTheTruth:
     def test_channel_watch_records_whether_the_list_loaded(self):
         """'channel page reached' followed by a failed pick is ambiguous. The

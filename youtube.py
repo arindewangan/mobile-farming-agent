@@ -855,6 +855,16 @@ async def _watch_video(serial: str, ctrl, bh: Behavior, watch_s: float, *, allow
 # still loading pays either — _await_content returns as soon as content is up.
 _PICK_WAIT_S = 12.0
 _PICK_RETRY_S = 8.0
+# Some devices' results pages never expose a11y cells at all — the OCR and
+# positional tiers carry them, and they open videos perfectly well. Observed on
+# the fleet: a device reporting "list still empty" on all three videos of a
+# session while two of the three played. Waiting the full budget on those is
+# time spent on something that can never arrive, so after this many consecutive
+# misses the wait drops to _PICK_BLIND_WAIT_S. One success resets it, because a
+# page that was merely slow must not be mistaken for one that is blind.
+_BLIND_AFTER = 2
+_PICK_BLIND_WAIT_S = 3.0
+_blind_pages: dict[str, int] = {}
 
 
 async def _on_watch_page(serial: str, bh: "Behavior") -> bool:
@@ -891,12 +901,21 @@ async def _pick_result(serial: str, ctrl, bh: Behavior) -> bool:
     # 2 (OCR) and 3 (positional) exist. So we wait, nudge, wait again — and then
     # proceed regardless. A healthy device pays one UI read, because
     # _await_content returns the moment content is present.
-    if not await _await_content(serial, bh, bh.sel("cell_probes"), timeout=_PICK_WAIT_S):
+    blind = _blind_pages.get(serial, 0) >= _BLIND_AFTER
+    if await _await_content(serial, bh, bh.sel("cell_probes"),
+                            timeout=_PICK_BLIND_WAIT_S if blind else _PICK_WAIT_S):
+        _blind_pages[serial] = 0          # cells do show here — it was just slow
+    else:
+        _blind_pages[serial] = _blind_pages.get(serial, 0) + 1
         # A small scroll often triggers the lazy fetch that the tab switch or
-        # deep-link started but never finished.
+        # deep-link started but never finished. Worth doing even on a blind
+        # page: it also moves past a promo header, which is a separate reason
+        # the first pick misses.
         await humanize.human_scroll(ctrl, w, h, "up", random.uniform(0.2, 0.4))
         await bh.pause(0.7, 1.4)
-        if not await _await_content(serial, bh, bh.sel("cell_probes"), timeout=_PICK_RETRY_S):
+        if blind:
+            _log(serial, "results page has no a11y cells here — skipping the long wait")
+        elif not await _await_content(serial, bh, bh.sel("cell_probes"), timeout=_PICK_RETRY_S):
             _log(serial, "no a11y cells after waiting — continuing (page may be a11y-blind)")
 
     async def _try_open(x, y) -> bool:
