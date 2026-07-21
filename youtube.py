@@ -2002,6 +2002,15 @@ async def onboard(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     return res
 
 
+# A flow with no max_run_s must still not run forever — an unbounded flow is
+# how one device held a concurrency slot for 44 minutes.
+_HARD_CAP_DEFAULT_S = 1800.0
+# Grace for a flow to finish its own cleanup after bh.expired() should already
+# have ended it. Stays well under the backend's dispatch timeout (budget + 240)
+# so the AGENT reports the timeout instead of the call appearing to hang.
+_HARD_CAP_MARGIN_S = 90.0
+
+
 _FLOWS = {"watch_link": watch_link, "search_watch": search_watch,
           "channel_watch": channel_watch, "channel_binge": channel_binge,
           "channel_all": channel_all, "watch_ids": watch_ids,
@@ -2055,9 +2064,39 @@ async def run(serial: str, ctrl, payload: dict) -> dict:
                   llm_fallback=_truthy(payload.get("llm_fallback")),
                   detect_blocks=_truthy(payload.get("detect")),
                   profile=profile)
+    # HARD enforcement of the time budget.
+    #
+    # bh.expired() is advisory: flows check it at loop boundaries, so anything
+    # that blocks INSIDE one operation ignores it entirely. Measured on the
+    # fleet: a device set to max_run_s=2400 was still inside its flow when the
+    # backend gave up at 2640s ("Agent did not answer 'youtube'"), having held
+    # one of only two concurrency slots for forty-four minutes and starved the
+    # other eighteen devices in the queue.
+    #
+    # So the deadline is enforced here, at the one point that cannot be skipped.
+    # The margin lets a flow finish its own cleanup first — bh.expired() should
+    # normally end it well before this — and the total stays comfortably under
+    # the backend's own dispatch timeout so the AGENT reports the timeout rather
+    # than the connection appearing to die.
+    budget = _opt_float(payload.get("max_run_s")) or _HARD_CAP_DEFAULT_S
+    hard = budget + _HARD_CAP_MARGIN_S
     try:
-        res = await fn(serial, ctrl, payload, bh)
+        res = await asyncio.wait_for(fn(serial, ctrl, payload, bh), timeout=hard)
         res.setdefault("behavior", bh.style)
         return res
+    except asyncio.TimeoutError:
+        _log(serial, f"flow {flow} exceeded its {hard:.0f}s budget — abandoning")
+        # Leave the device in a known state rather than mid-flow, or the next
+        # run inherits whatever screen this one was stuck on.
+        try:
+            await adb.force_stop(serial, PKG)
+        except Exception:  # noqa: BLE001 — best effort; the report matters more
+            pass
+        return {"ok": False, "flow": flow, "timed_out": True,
+                "checkpoints": _cp_trail(serial),
+                "reason": f"flow exceeded its {hard:.0f}s time budget",
+                "detail": (f"screen changed — manual fix required: [{flow}] flow exceeded "
+                           f"its {hard:.0f}s time budget (reached: "
+                           f"{' → '.join(_cp_trail(serial)) or 'no stage'})")}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "flow": flow, "error": str(e)}
