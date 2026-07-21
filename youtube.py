@@ -1303,6 +1303,178 @@ async def channel_binge(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
             "count": len(watched), "detail": watched}
 
 
+# ─────────────────────────────────────────── watch every video on a channel ──
+# WHY THIS EXISTS, AND WHY IT DOES NOT USE SEARCH
+#
+# channel_watch / channel_binge navigate by SEARCHING for the channel and then
+# blind-tapping the first result at fixed screen fractions. Measured on real
+# hardware, that is where the fleet's YouTube work was actually failing:
+#
+#   • the configured handle "@HypeGaming" does not exist (the real one is
+#     "@HypeGaming." — with a trailing dot), so the deep link 404'd,
+#   • the flow fell back to channel-filtered search, which returned THREE
+#     near-identical channels (Hype Gaming / OnHype Gamer / HYPE GAMING),
+#   • a positional tap picked one of them, or nothing,
+#   • and the run then reported "list still empty" — truthfully, because it was
+#     sitting on a search page, which has no video cells at all.
+#
+# So this flow refuses to guess. It takes a CANONICAL channel id (UC…),
+# resolved once by the control plane from a handle/URL, and deep-links straight
+# to that channel's Videos tab. Verified on device: the app opens the right
+# channel with Videos already selected. There is no search step to be ambiguous.
+#
+# Iteration is by content-desc, not by pixels: every row carries
+#   "<title> - <duration> - Go to channel - <channel> - <views> - <age> - play video"
+# which gives an exact tap target, the owning channel (so a stray recommendation
+# cannot be mistaken for the channel's own video), and a stable dedup key. No
+# OCR and no model — the Pi stays a bridge.
+_PLAY_MARKER = "play video"
+
+
+def _cell_title(desc: str) -> str:
+    """Best-effort readable title from a cell's content-desc. Logging only —
+    dedup uses the whole desc, because titles are not unique and contain the
+    same " - " the metadata uses."""
+    head = desc.split(" - Go to channel - ", 1)[0]
+    return re.sub(r"\s+-\s+\d+\s+(second|minute|hour)s?\s*$", "", head).strip() or desc[:60]
+
+
+def _cell_channel(desc: str) -> str:
+    m = re.search(r" - Go to channel - (.+?) - ", desc)
+    return m.group(1).strip() if m else ""
+
+
+async def channel_all(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    """Watch a channel's videos in list order, never the same one twice.
+
+    Stops on whichever comes first: `max_videos`, the `max_run_s` budget, or the
+    end of the list (two consecutive scrolls that reveal no new video).
+    """
+    _cp_reset(serial)
+    cid = str(p.get("channel_id") or "").strip()
+    if not cid.startswith("UC"):
+        return _abort("channel_all", {"status": "unknown", "reason":
+                      f"channel_id must be a canonical UC… id, got {cid!r} — "
+                      "resolve the handle first (the control plane does this)"})
+    want_channel = str(p.get("channel_name") or "").strip()
+    max_videos = max(0, int(p.get("max_videos", 0) or 0))     # 0 = until exhausted
+    sort = str(p.get("sort", "") or "").strip()               # Latest|Popular|Oldest
+    ws = p.get("watch_s", 120)
+
+    _log(serial, f"channel_all start: {cid} max={max_videos or '∞'}")
+    await _set_orientation(serial, bh.orientation)
+    await adb.force_stop(serial, PKG)
+    await bh.pause(0.8, 1.7)
+    await _open_url(serial, f"https://www.youtube.com/channel/{cid}/videos")
+    on = await _await_online(serial, ctrl, bh, timeout=25)
+    if not on["ok"]:
+        return _abort("channel_all", on, serial)
+    _cp(serial, "youtube opened")
+    await _set_orientation(serial, bh.orientation)
+
+    # Wait for the Videos grid itself, not merely for chrome to render.
+    if not await _await_content(serial, bh, [_PLAY_MARKER], timeout=20.0):
+        st = {"status": "unknown", "reason": "channel opened but no videos are listed",
+              "expected": [_PLAY_MARKER], "seen": await _visible_texts(serial)}
+        return _abort("channel_all", st, serial)
+    _cp(serial, "channel videos listed")
+
+    if sort:                                  # Latest / Popular / Oldest chips
+        await _find_and_tap(serial, ctrl, sort, sort.upper(), ocr=True)
+        await bh.pause(1.0, 2.0)
+        await _await_content(serial, bh, [_PLAY_MARKER], timeout=12.0)
+
+    seen: set[str] = set()
+    watched: list[dict] = []
+    misses = 0
+    dry_scrolls = 0
+
+    while not bh.expired():
+        if max_videos and len(watched) >= max_videos:
+            break
+        res = await recipeui.list_cells(serial, _PLAY_MARKER)
+        cells = res.get("cells") or []
+        # A recommendation shelf can splice other channels' videos into the
+        # list. Watching those would silently make "all videos of THIS channel"
+        # a lie, so they are filtered out rather than counted.
+        if want_channel:
+            cells = [c for c in cells
+                     if not _cell_channel(c["desc"])
+                     or _cell_channel(c["desc"]).lower() == want_channel.lower()]
+        fresh = [c for c in cells if c["desc"] not in seen]
+
+        if not fresh:
+            if dry_scrolls >= 2:
+                _log(serial, "no new videos after scrolling — reached the end of the list")
+                _cp(serial, "list exhausted")
+                break
+            dry_scrolls += 1
+            await humanize.human_scroll(ctrl, ctrl.width, ctrl.height, "up",
+                                        random.uniform(0.55, 0.85))
+            await bh.pause(1.0, 2.2)
+            continue
+        dry_scrolls = 0
+
+        cell = fresh[0]
+        seen.add(cell["desc"])                # mark BEFORE opening: a video that
+                                              # fails to open must not be retried
+                                              # forever on the next pass
+        title = _cell_title(cell["desc"])
+        n = len(watched) + 1
+        _log(serial, f"opening {n}: {title[:70]}")
+        await _click(serial, cell["x"], cell["y"])
+
+        opened = False
+        for _ in range(8):
+            await bh.pause(0.6, 1.1)
+            if await _on_watch_page(serial, bh):
+                opened = True
+                break
+        if not opened:
+            misses += 1
+            _log(serial, f"did not reach a watch page for: {title[:60]}")
+            watched.append({"n": n, "title": title, "ok": False,
+                            "reason": "tap did not open a watch page"})
+            await adb.keyevent(serial, "KEYCODE_BACK")
+            await bh.pause(1.0, 2.0)
+            if misses >= 3 and not watched_ok(watched):
+                # Three opens in a row that go nowhere means the page is not what
+                # we think it is; stop rather than grind through the whole list.
+                return _abort("channel_all", {
+                    "status": "unknown",
+                    "reason": f"{misses} consecutive videos failed to open",
+                    "seen": await _visible_texts(serial)}, serial)
+            continue
+        misses = 0
+
+        await _set_orientation(serial, bh.orientation)
+        r = await _watch_video(serial, ctrl, bh, _watch_s_pick(ws))
+        secs = float(r.get("watched_s") or 0)
+        watched.append({"n": n, "title": title, "ok": secs > 0, "watched_s": secs})
+        _cp(serial, f"watched {n}: {title[:40]}")
+        _log(serial, f"watched {n}: {secs:g}s — {title[:60]}")
+        await adb.keyevent(serial, "KEYCODE_BACK")     # back to the Videos list
+        await bh.pause(1.2, 2.8)
+        await _await_content(serial, bh, [_PLAY_MARKER], timeout=12.0)
+
+    await _close_app(serial, ctrl, bh)
+    played = [w for w in watched if w.get("ok")]
+    total_s = round(sum(float(w.get("watched_s") or 0) for w in played), 1)
+    out = {"ok": bool(played), "flow": "channel_all", "channel_id": cid,
+           "channel": want_channel, "videos_ok": len(played), "attempted": len(watched),
+           "distinct_seen": len(seen), "total_watched_s": total_s,
+           "checkpoints": _cp_trail(serial), "detail": watched}
+    if not played:
+        out["reason"] = (f"0 of {len(watched)} videos played"
+                         if watched else "no videos were opened at all")
+    _log(serial, f"channel_all done: {len(played)}/{len(watched)} played, {total_s}s total")
+    return out
+
+
+def watched_ok(rows: list[dict]) -> bool:
+    return any(r.get("ok") for r in rows)
+
+
 async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     _cp_reset(serial)
     _log(serial, "shorts start")
@@ -1618,6 +1790,7 @@ async def onboard(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
 
 _FLOWS = {"watch_link": watch_link, "search_watch": search_watch,
           "channel_watch": channel_watch, "channel_binge": channel_binge,
+          "channel_all": channel_all,
           "shorts": shorts, "session": session, "onboard": onboard}
 
 

@@ -111,6 +111,51 @@ async def ui_state(serial: str, queries: list[str] | None = None) -> dict:
 _DIAG_ATTRS = ("text", "resource-id", "content-desc", "class", "clickable", "enabled", "bounds", "package")
 
 
+async def list_cells(serial: str, marker: str, limit: int = 40) -> dict:
+    """Every on-screen list cell whose content-desc contains `marker`, in
+    top-to-bottom order, with its tap centre.
+
+    YouTube's list rows carry their whole identity in ONE accessibility
+    attribute — content-desc — and nothing useful in `text`:
+
+        "Jett + Shape Of You = PERFECTION | Valorant Edit - 36 seconds
+         - Go to channel - Hype Gaming - 71 views - 1 day ago - play video"
+
+    Title, duration, owning channel, views, age, and a "play video" marker.
+    `ui_state` only answers "is this needle present" for a fixed query list and
+    returns a single centre, so it cannot enumerate rows or tell two rows apart
+    — which is what an "open every video, none twice" flow needs. Hence this.
+
+    The full content-desc is returned as `desc` and is the right DEDUP KEY: it
+    is unique per video and stable across scrolls, whereas a parsed title can
+    collide (channels really do publish "Part 1" twice) and parsing is fragile
+    because titles themselves contain " - ".
+
+    Sorted by y then x so "first unwatched" means the topmost one, matching how
+    a person reads the list.
+    """
+    try:
+        await adb.shell(serial, "uiautomator dump /sdcard/mf_ui.xml")
+        r = await adb.shell(serial, "cat /sdcard/mf_ui.xml")
+        xml = r.get("stdout", "")
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e), "cells": []}
+
+    needle = (marker or "").lower()
+    out = []
+    for n in _parse_nodes(xml):
+        desc = (n.get("content-desc") or "").strip()
+        if not desc or needle not in desc.lower():
+            continue
+        c = _center(n.get("bounds", ""))
+        if not c:
+            continue
+        out.append({"desc": desc, "x": c[0], "y": c[1],
+                    "bounds": n.get("bounds", "")})
+    out.sort(key=lambda d: (d["y"], d["x"]))
+    return {"ok": bool(xml), "cells": out[:limit]}
+
+
 async def ui_dump_diagnostic(serial: str, needle: str = "") -> dict:
     """Full node-level dump — bounds, class, clickable, resource-id, not just
     text — for elements matching `needle`, plus every clickable element on
