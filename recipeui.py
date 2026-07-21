@@ -20,7 +20,23 @@ import re
 
 import adb
 
-_NODE = re.compile(r"<node\b[^>]*?/>", re.DOTALL)
+# Matches a node's OPENING tag whether or not it self-closes.
+#
+# This was `<node\b[^>]*?/>` — self-closing only. uiautomator emits a container
+# as `<node …>` with children and only a LEAF as `<node … />`, so every
+# container node was invisible to this module. Measured on a real channel page:
+# 114 node tags in the dump, 48 parsed, and BOTH video cells among the 66 that
+# were dropped — because a YouTube video row is an android.view.ViewGroup that
+# holds the thumbnail and title as children, and carries its whole identity
+# (title, duration, channel, views, age) in its own content-desc.
+#
+# That is why `cell_probes` never matched on a channel page, why flows reported
+# "list still empty" while the screen plainly showed videos, and why picking
+# fell through to OCR and blind positional taps.
+#
+# `(?:[^>"]|"[^"]*")*` rather than `[^>]*` so a `>` INSIDE a quoted attribute
+# value cannot end the tag early — video titles really do contain ">".
+_NODE = re.compile(r'<node\b(?:[^>"]|"[^"]*")*/?>', re.DOTALL)
 _ATTR = re.compile(r'(\w[\w-]*)="([^"]*)"')
 _BOUNDS = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
 
