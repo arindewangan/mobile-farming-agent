@@ -126,3 +126,35 @@ class TestPlaybackDetection:
         """Every UI signal proves the watch PAGE rendered, which is exactly the
         state a stalled video also reaches."""
         assert "media_session" in inspect.getsource(youtube._is_playing)
+
+
+class TestNoBlindTapping:
+    """A device that had FINISHED its videos was found sitting in the Clock app.
+
+    Every engagement branch in the watch loop taps at fixed player coordinates.
+    When the player is not on screen — video ended, ad took over, flow drifted —
+    those taps land on whatever is there instead, and can leave the phone in an
+    unrelated app. Which then looks, to anyone glancing at the fleet, exactly
+    like the automation went haywire.
+    """
+
+    def _src(self):
+        import inspect
+        return inspect.getsource(youtube._watch_video)
+
+    def test_the_loop_checks_playback_before_tapping(self):
+        src = self._src()
+        assert src.index("_is_playing(serial)") < src.index("roll = random.random()")
+
+    def test_a_paused_player_is_waited_on_not_abandoned(self):
+        """Paused or buffering is still the watch page — leaving would cut a
+        video short for a stall that resolves itself."""
+        assert "_on_watch_page(serial, bh)" in self._src()
+
+    def test_a_lost_player_ends_the_loop_rather_than_tapping(self):
+        src = self._src()
+        assert "player_lost" in src
+
+    def test_the_check_uses_the_media_session_not_the_screen(self):
+        import inspect
+        assert "media_session" in inspect.getsource(youtube._is_playing)

@@ -118,3 +118,33 @@ class TestTimeoutBehaviour:
         monkeypatch.setitem(youtube._FLOWS, "quick", quick)
         r = await youtube.run("S1", None, {"flow": "quick", "max_run_s": 60})
         assert r["ok"] is True and "timed_out" not in r
+
+
+class TestFailuresLeaveAKnownScreen:
+    """Seventeen phones parked on stale YouTube screens read as a dead fleet.
+
+    A FAILED flow returns without reaching _close_app, so it leaves the device
+    on whatever screen it gave up on. A successful flow's exit is _close_app's
+    business and deliberately varies — sometimes leaving the app open, like a
+    person locking the phone mid-video — so this must not touch that.
+    """
+
+    def test_a_failed_flow_is_parked(self):
+        src = inspect.getsource(youtube.run)
+        assert 'if not res.get("ok"):' in src and "_park(serial)" in src
+
+    def test_a_successful_flow_is_left_to_close_app(self):
+        """Overriding the human-like exit would trade a diagnosis problem for a
+        behavioural tell."""
+        src = inspect.getsource(youtube.run)
+        head = src.split('if not res.get("ok"):')[0]
+        assert "_park(serial)" not in head
+
+    def test_parking_is_best_effort(self):
+        """Cleanup must never replace the diagnosis being returned."""
+        src = inspect.getsource(youtube._park)
+        assert "except Exception" in src
+
+    def test_parking_stops_the_app_and_goes_home(self):
+        src = inspect.getsource(youtube._park)
+        assert "force_stop" in src and "KEYCODE_HOME" in src

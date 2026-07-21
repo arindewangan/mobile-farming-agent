@@ -900,6 +900,20 @@ async def _watch_video(serial: str, ctrl, bh: Behavior, watch_s: float, *, allow
                 actions.append(f"midroll_wait×{mid['waited']}")
             continue
 
+        # Every branch below taps at fixed player coordinates. If the player is
+        # NOT on screen — the video ended, an ad took over, the flow drifted —
+        # those taps land on whatever is there instead. That is how a device
+        # that had finished its videos ended up sitting in the Clock app.
+        #
+        # Checked from the media session rather than the UI: it is the OS's own
+        # view, costs one shell call, and cannot be fooled by a layout change.
+        if not await _is_playing(serial):
+            if await _on_watch_page(serial, bh):
+                continue                     # paused/buffering — wait, don't tap
+            _log(serial, "player is gone — stopping the watch loop instead of tapping blind")
+            actions.append("player_lost")
+            break
+
         roll = random.random()
         if roll < t_pause:                                       # pause, look away, resume
             await _double_tap(serial, w * bh.geo("player_cx", 0.5), h * bh.geo("player_cy", 0.16))
@@ -1671,8 +1685,15 @@ async def watch_ids(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         # "did it hit an ad, and did it get past it" — which is the whole point
         # of the ad handling, and is invisible in a bare watch time.
         acts = [a for a in (res.get("actions") or []) if "ad" in a.lower()]
+        # A video that opened and played nothing needs a REASON. Without one the
+        # summary read "first failure: None", which tells an operator nothing —
+        # and the commonest cause is real and actionable: ads ate the budget.
+        why = None
+        if secs <= 0:
+            why = ("ads consumed the time budget before the video played"
+                   if acts else "opened but played 0s")
         watched.append({"n": i, "id": vid, "ok": secs > 0, "watched_s": secs,
-                        "playing_at_end": still, "ads": acts})
+                        "playing_at_end": still, "ads": acts, "reason": why})
         _cp(serial, f"video {i}/{len(ids)} watched {secs:g}s")
         _log(serial, f"{i}/{len(ids)} {vid}: {secs:g}s")
 
@@ -2038,6 +2059,19 @@ def _parse_profile(v) -> dict | None:
     return None
 
 
+async def _park(serial: str) -> None:
+    """Leave the device on a known screen after a failure.
+
+    Best-effort and silent: this is cleanup, and a cleanup error must never
+    replace the diagnosis the caller is about to return.
+    """
+    try:
+        await adb.force_stop(serial, PKG)
+        await adb.keyevent(serial, "KEYCODE_HOME")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def run(serial: str, ctrl, payload: dict) -> dict:
     """Entry point for the agent's `youtube` action. payload = {flow, ...,
     behavior?, max_run_s?, orientation?, engage?, llm_fallback?, detect?, profile?}."""
@@ -2083,15 +2117,24 @@ async def run(serial: str, ctrl, payload: dict) -> dict:
     try:
         res = await asyncio.wait_for(fn(serial, ctrl, payload, bh), timeout=hard)
         res.setdefault("behavior", bh.style)
+        # A FAILED flow returns without ever reaching _close_app, so it leaves
+        # the device parked on whatever screen it gave up on — a channel page, a
+        # half-loaded player. Seventeen phones sitting on stale YouTube screens
+        # is indistinguishable from seventeen stuck ones, and was reasonably
+        # read as a dead fleet.
+        #
+        # Only on failure: a SUCCESSFUL flow's exit is _close_app's business,
+        # and it deliberately varies (sometimes leaving the app open, like a
+        # person locking the phone mid-video). Overriding that would trade a
+        # diagnosis problem for a behavioural tell.
+        if not res.get("ok"):
+            await _park(serial)
         return res
     except asyncio.TimeoutError:
         _log(serial, f"flow {flow} exceeded its {hard:.0f}s budget — abandoning")
         # Leave the device in a known state rather than mid-flow, or the next
         # run inherits whatever screen this one was stuck on.
-        try:
-            await adb.force_stop(serial, PKG)
-        except Exception:  # noqa: BLE001 — best effort; the report matters more
-            pass
+        await _park(serial)
         return {"ok": False, "flow": flow, "timed_out": True,
                 "checkpoints": _cp_trail(serial),
                 "reason": f"flow exceeded its {hard:.0f}s time budget",
