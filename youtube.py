@@ -295,6 +295,9 @@ _AD_WAIT_S = 45.0           # bumpers are 6s, non-skippable pre-rolls 15–30s
 _AD_CLEAR_POLLS = 2         # consecutive clear polls before believing it is over
 _AD_POD_MAX = 4             # ads back-to-back before giving up on this video
 _SKIP_DEBOUNCE_S = 3.0      # a second tap lands on the video and pauses it
+# Consecutive no-playback ticks before a video is called finished. A buffer or
+# a pause clears in a few seconds; the end screen never does.
+_STALL_TICKS = 3      # a second tap lands on the video and pauses it
 
 
 async def _ad_present(serial: str, bh: "Behavior") -> bool:
@@ -861,6 +864,7 @@ async def _watch_video(serial: str, ctrl, bh: Behavior, watch_s: float, *, allow
     t_peek = t_sub + bh.wp("peek_description")
 
     did = {"like": False, "subscribe": False, "comments": False, "peek": False}
+    stalled = 0                 # consecutive ticks with no playback
     actions: list[str] = []
     last_orient = _now()
 
@@ -908,11 +912,22 @@ async def _watch_video(serial: str, ctrl, bh: Behavior, watch_s: float, *, allow
         # Checked from the media session rather than the UI: it is the OS's own
         # view, costs one shell call, and cannot be fooled by a layout change.
         if not await _is_playing(serial):
-            if await _on_watch_page(serial, bh):
-                continue                     # paused/buffering — wait, don't tap
-            _log(serial, "player is gone — stopping the watch loop instead of tapping blind")
-            actions.append("player_lost")
+            # A FINISHED video still shows the watch page: YouTube's end screen
+            # keeps Like/Share/Subscribe, so "still on the watch page" cannot
+            # tell "paused for a moment" from "this video is over". Measured: a
+            # 36s video with a 300s target idled here for the full target and
+            # then blew the run's budget.
+            #
+            # So tolerate a SHORT stall — a buffer or a pause resolves in a few
+            # seconds — and treat sustained silence as the video having ended.
+            stalled += 1
+            if stalled < _STALL_TICKS and await _on_watch_page(serial, bh):
+                continue
+            why = "video ended" if await _on_watch_page(serial, bh) else "player is gone"
+            _log(serial, f"{why} — stopping the watch loop instead of tapping blind")
+            actions.append("video_ended" if "ended" in why else "player_lost")
             break
+        stalled = 0
 
         roll = random.random()
         if roll < t_pause:                                       # pause, look away, resume
@@ -1689,7 +1704,7 @@ async def watch_ids(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         # asked for, and it used to be invisible while the taps that followed it
         # left devices in unrelated apps.
         acts = [a for a in (res.get("actions") or [])
-                if "ad" in a.lower() or a == "player_lost"]
+                if "ad" in a.lower() or a in ("player_lost", "video_ended")]
         # A video that opened and played nothing needs a REASON. Without one the
         # summary read "first failure: None", which tells an operator nothing —
         # and the commonest cause is real and actionable: ads ate the budget.

@@ -158,3 +158,19 @@ class TestNoBlindTapping:
     def test_the_check_uses_the_media_session_not_the_screen(self):
         import inspect
         assert "media_session" in inspect.getsource(youtube._is_playing)
+
+    def test_a_finished_video_is_detected_not_idled_through(self):
+        """YouTube's end screen keeps Like/Share/Subscribe, so "still on the
+        watch page" cannot distinguish a pause from a finished video. Measured:
+        a 36s video with a 300s target idled for the full target and then blew
+        the run's time budget."""
+        src = self._src()
+        assert "_STALL_TICKS" in src and "video_ended" in src
+
+    def test_a_short_stall_is_tolerated(self):
+        """A buffer or a pause clears in seconds; breaking on the first quiet
+        tick would cut healthy videos short."""
+        assert youtube._STALL_TICKS >= 2
+
+    def test_the_stall_counter_resets_on_playback(self):
+        assert "stalled = 0" in self._src()
