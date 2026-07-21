@@ -850,6 +850,13 @@ async def _watch_video(serial: str, ctrl, bh: Behavior, watch_s: float, *, allow
 
 
 # ----------------------------------------------------- search / pick ---------
+# How long _pick_result waits for a list to have rows before tapping at it, and
+# how long it waits again after a nudge scroll. Only a page that is genuinely
+# still loading pays either — _await_content returns as soon as content is up.
+_PICK_WAIT_S = 12.0
+_PICK_RETRY_S = 8.0
+
+
 async def _on_watch_page(serial: str, bh: "Behavior") -> bool:
     m = await _ui(serial, *bh.sel("watch_markers"))
     return any(v.get("present") for v in m.values())
@@ -863,6 +870,34 @@ async def _pick_result(serial: str, ctrl, bh: Behavior) -> bool:
     page rendered (`_on_watch_page` works reliably) and backs out on a miss."""
     w, h = ctrl.width, ctrl.height
     await _force_portrait(serial, bh)      # positional taps assume portrait coords
+
+    # Make sure there is something to pick BEFORE tapping at the page.
+    #
+    # Five of this function's six call sites reached it after nothing but a
+    # fixed pause or a scroll, so a list that had not finished loading was
+    # picked at anyway: all three tiers below miss, each burning ~6s confirming
+    # a watch page that never appears, and the flow then reports "unexpected
+    # screen". A real failure looked like this — the guard wanted a video
+    # player and the screen held only the channel header and the nav bar:
+    #
+    #   waiting for: id/watch_player, Like this video
+    #   on screen:   HypeGaming, Home, Shorts, Subscriptions, You
+    #
+    # The wait lives HERE rather than at each call site because every caller
+    # has the same race and only one of them handled it.
+    #
+    # It is deliberately NOT a gate. Absent cell probes do not mean an empty
+    # page: some results pages are a11y-blind, which is the entire reason tiers
+    # 2 (OCR) and 3 (positional) exist. So we wait, nudge, wait again — and then
+    # proceed regardless. A healthy device pays one UI read, because
+    # _await_content returns the moment content is present.
+    if not await _await_content(serial, bh, bh.sel("cell_probes"), timeout=_PICK_WAIT_S):
+        # A small scroll often triggers the lazy fetch that the tab switch or
+        # deep-link started but never finished.
+        await humanize.human_scroll(ctrl, w, h, "up", random.uniform(0.2, 0.4))
+        await bh.pause(0.7, 1.4)
+        if not await _await_content(serial, bh, bh.sel("cell_probes"), timeout=_PICK_RETRY_S):
+            _log(serial, "no a11y cells after waiting — continuing (page may be a11y-blind)")
 
     async def _try_open(x, y) -> bool:
         await _click(serial, x, y)
@@ -1137,10 +1172,13 @@ async def channel_watch(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     await bh.pause(0.9, 2.0)
     # The tab switch repopulates the list; wait for real cells before scrolling
     # and picking, so a cold load doesn't send the picker at an empty page.
-    await _await_content(serial, bh, bh.sel("cell_probes"), timeout=15.0)
+    # _pick_result now waits again on its own — this call stays so the CHECKPOINT
+    # can record whether the list was ever there, which is the difference between
+    # "the page loaded and the pick failed" and "the page never filled in".
+    listed = await _await_content(serial, bh, bh.sel("cell_probes"), timeout=15.0)
     await humanize.human_scroll(ctrl, ctrl.width, ctrl.height, "up", random.uniform(0.25, 0.7))
     await bh.pause(0.6, 1.8)
-    _cp(serial, "channel page reached")
+    _cp(serial, "channel page reached" if listed else "channel page reached (list still empty)")
     on_watch = await _pick_result(serial, ctrl, bh)
     if not on_watch and not bh.expired():
         # A channel page often opens on a non-list state first (a pinned/loading
