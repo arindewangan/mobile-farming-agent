@@ -68,9 +68,29 @@ def _log(serial: str, msg: str) -> None:
 # no extra ADB round trip — a checkpoint costs one list append.
 _checkpoints: dict[str, list[str]] = {}
 
+# Serials whose trail belongs to a SESSION rather than to a single flow.
+#
+# `session` runs many videos by calling the single-video flows, and each of
+# those opens with its own _cp_reset — so every video wiped the trail of the one
+# before it. A six-video session that failed on the last one reported the same
+# trail as one that failed instantly, losing exactly the fact that mattered:
+# five videos had already played. Most recipes are `session`, so this was the
+# common case, not an edge one.
+_cp_owned: set[str] = set()
 
-def _cp_reset(serial: str) -> None:
+
+def _cp_reset(serial: str, *, own: bool = False) -> None:
+    """Start a fresh trail. `own=True` claims it for a session, after which the
+    sub-flows' own resets are ignored until _cp_release."""
+    if own:
+        _cp_owned.add(serial)
+    elif serial in _cp_owned:
+        return
     _checkpoints[serial] = []
+
+
+def _cp_release(serial: str) -> None:
+    _cp_owned.discard(serial)
 
 
 def _cp(serial: str, name: str) -> None:
@@ -438,8 +458,15 @@ async def _ensure(serial: str, ctrl, bh: Behavior, *expect: str, timeout: float 
 
         await bh.pause(0.6, 1.2)
 
-    _log(serial, f"guard timeout waiting for {list(expect)} — visible: {await _visible_texts(serial)}")
-    return {"ok": False, "status": "unknown", "reason": "unexpected screen"}
+    seen = await _visible_texts(serial)
+    _log(serial, f"guard timeout waiting for {list(expect)} — visible: {seen}")
+    # Carry BOTH what we wanted and what was actually there. This used to go only
+    # to the Pi's stderr, which an operator using the web UI cannot read — so the
+    # single most useful fact about the failure ("it was sitting on a sign-in
+    # wall", "the feed was empty") was computed, logged, and thrown away, leaving
+    # a bare "unexpected screen" that is the same text for every cause.
+    return {"ok": False, "status": "unknown", "reason": "unexpected screen",
+            "expected": list(expect), "seen": seen}
 
 
 async def _visible_texts(serial: str) -> list[str]:
@@ -451,19 +478,34 @@ def _abort(flow: str, st: dict, serial: str | None = None) -> dict:
     reason = st.get("reason") or st.get("status") or "unexpected screen"
     blocked = st.get("status") == "blocked" or st.get("quarantine")
     trail = _cp_trail(serial) if serial else []
+    # What the guard was waiting for, and what was actually on screen. Without
+    # these "unexpected screen" is identical for a sign-in wall, an empty feed
+    # and a crashed app — three different problems, one message.
+    # strip() before the emptiness test: a whitespace-only node is truthy and
+    # would render as a blank entry between two commas.
+    seen = [str(s).strip() for s in (st.get("seen") or []) if str(s).strip()][:6]
+    want = [str(w).strip() for w in (st.get("expected") or []) if str(w).strip()][:4]
+    if want:
+        reason = f"{reason} (waiting for: {', '.join(want)})"
+    if seen:
+        reason = f"{reason} — on screen: {', '.join(seen)}"
     # Put the trail IN the reason, not just alongside it: the backend surfaces
     # `reason` in the run log, and a field nobody reads helps nobody.
     if trail:
         reason = f"{reason} (reached: {' → '.join(trail)})"
     elif serial:
         reason = f"{reason} (no stage reached — the app never came up)"
+    # Name the flow. A `session` runs many videos through the single-video
+    # flows, so "which flow failed" is not answerable from the recipe alone —
+    # and the answer was already in this dict, just never in the text an
+    # operator reads.
     return {
         "ok": False, "flow": flow, "status": st.get("status", "unknown"),
         "manual": True, "reason": reason, "checkpoints": trail,
-        "quarantine": bool(blocked),
+        "quarantine": bool(blocked), "seen": seen,
         "state": st.get("state") or ("blocked" if blocked else None),
-        "detail": (f"account blocked — quarantined: {reason}" if blocked
-                   else f"screen changed — manual fix required: {reason}"),
+        "detail": (f"account blocked — quarantined: [{flow}] {reason}" if blocked
+                   else f"screen changed — manual fix required: [{flow}] {reason}"),
     }
 
 
@@ -1313,7 +1355,8 @@ def _watch_s_pick(spec) -> float:
 
 
 async def session(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
-    _cp_reset(serial)
+    # Claim the trail so the per-video sub-flows below cannot wipe it.
+    _cp_reset(serial, own=True)
     """Watch a SESSION of many videos in a chosen pattern, reusing the single-video
     flows so every video keeps the full human behaviour (pause/resume/skip/like,
     varied watch time, boredom). Stops at ``count`` videos or the ``max_run_s``
@@ -1370,23 +1413,44 @@ async def session(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         return _abort("session", {"status": "unknown", "reason": f"unknown pattern '{pattern}'"})
 
     watched: list[dict] = []
-    for i, (fn, sub) in enumerate(plan, 1):
-        if bh.expired():
-            _log(serial, f"session: max_run_s reached after {len(watched)} video(s)")
-            break
-        sub = {**sub, "watch_s": _watch_s_pick(ws)}
-        try:
-            r = await fn(serial, ctrl, sub, bh)
-        except Exception as e:  # noqa: BLE001
-            r = {"ok": False, "error": str(e)}
-        watched.append({"n": i, "flow": r.get("flow"), "ok": bool(r.get("ok")),
-                        "watched_s": r.get("watched_s")})
-        _log(serial, f"session {i}/{len(plan)}: {r.get('flow')} ok={r.get('ok')}")
-        if i < len(plan) and not bh.expired():
-            await bh.pause(1.5, 5.0)          # a human gap before the next video
-    return {"ok": any(w["ok"] for w in watched), "flow": "session", "pattern": pattern,
-            "videos_ok": sum(1 for w in watched if w["ok"]), "planned": len(plan),
-            "detail": watched}
+    try:
+        for i, (fn, sub) in enumerate(plan, 1):
+            if bh.expired():
+                # Running out of the session budget is a NORMAL ending, not a
+                # fault — but it is invisible unless it is said, and a session
+                # that stopped at 2 of 6 looks identical to one that failed.
+                _log(serial, f"session: max_run_s reached after {len(watched)} video(s)")
+                _cp(serial, f"stopped: out of time after {len(watched)}/{len(plan)}")
+                break
+            _cp(serial, f"video {i}/{len(plan)} start")
+            sub = {**sub, "watch_s": _watch_s_pick(ws)}
+            try:
+                r = await fn(serial, ctrl, sub, bh)
+            except Exception as e:  # noqa: BLE001
+                r = {"ok": False, "error": str(e)}
+            ok = bool(r.get("ok"))
+            watched.append({"n": i, "flow": r.get("flow"), "ok": ok,
+                            "watched_s": r.get("watched_s"),
+                            # Keep WHY a video failed. Without it a session
+                            # reports "2 of 6 ok" and nothing about the four.
+                            "reason": None if ok else (r.get("reason") or r.get("error")),
+                            "checkpoints": r.get("checkpoints")})
+            _cp(serial, f"video {i}/{len(plan)} {'ok' if ok else 'FAILED'}")
+            _log(serial, f"session {i}/{len(plan)}: {r.get('flow')} ok={ok}")
+            if i < len(plan) and not bh.expired():
+                await bh.pause(1.5, 5.0)      # a human gap before the next video
+    finally:
+        _cp_release(serial)
+
+    failed = [w for w in watched if not w["ok"]]
+    out = {"ok": any(w["ok"] for w in watched), "flow": "session", "pattern": pattern,
+           "videos_ok": sum(1 for w in watched if w["ok"]), "planned": len(plan),
+           "checkpoints": _cp_trail(serial), "detail": watched}
+    # A session that watched NOTHING must not read as a bland "0 of 6" — say why
+    # the first failure happened, in the field the run log actually surfaces.
+    if failed and not out["ok"]:
+        out["reason"] = f"0 of {len(plan)} videos played — first failure: {failed[0].get('reason') or 'unknown'}"
+    return out
 
 
 # ---------------------------------------------------------- dispatch ---------
