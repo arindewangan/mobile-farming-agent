@@ -1475,6 +1475,115 @@ def watched_ok(rows: list[dict]) -> bool:
     return any(r.get("ok") for r in rows)
 
 
+async def _is_playing(serial: str) -> bool:
+    """Is audio actually playing right now?
+
+    Read from the media session, not the screen. Every UI signal used up to now
+    — a player id in the a11y tree, a "Like this video" button — says the watch
+    PAGE rendered, which is exactly the state a stalled or ad-blocked video also
+    reaches. PlaybackState 3 is PLAYING and is what the OS itself believes, so
+    it cannot be fooled by a layout change or an app update.
+    """
+    try:
+        r = await adb.shell(serial, "dumpsys media_session | grep -m4 'state=PlaybackState'")
+        out = r.get("stdout", "") or ""
+    except Exception:  # noqa: BLE001
+        return False
+    return "state=3" in out.replace(" ", "")
+
+
+async def _await_playback(serial: str, bh: Behavior, timeout: float = 35.0) -> bool:
+    deadline = _now() + timeout
+    while _now() < deadline:
+        if await _is_playing(serial):
+            return True
+        await bh.pause(0.8, 1.5)
+    return False
+
+
+async def watch_ids(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    """Watch an explicit list of video ids, in order.
+
+    WHY IDS AND NOT A LIST ON SCREEN
+    Discovering videos by scrolling a channel and reading the accessibility tree
+    produced two failures that cannot be parsed away: YouTube's row description
+    carries no channel-provenance field, so a recommendation shelf item is
+    indistinguishable from one of the channel's own uploads (a real run watched
+    @Kokage_Tsumugi and counted it as the target channel's); and "no new rows
+    after a scroll" is indistinguishable from "the next page is still loading",
+    so a 2,200-video channel was declared exhausted after two videos.
+
+    Handing the device exact ids removes both by construction — it never has to
+    answer "what is this?" — and makes the work resumable, because the list is
+    known before the first tap.
+    """
+    _cp_reset(serial)
+    raw = p.get("video_ids") or []
+    if isinstance(raw, str):
+        raw = [v.strip() for v in raw.split(",") if v.strip()]
+    ids = [str(v).strip() for v in raw if str(v).strip()]
+    if not ids:
+        return _abort("watch_ids", {"status": "unknown", "reason":
+                      "no video_ids given — the control plane enumerates the channel"})
+    ws = p.get("watch_s", 60)
+    _log(serial, f"watch_ids: {len(ids)} video(s)")
+
+    await _set_orientation(serial, bh.orientation)
+    watched: list[dict] = []
+
+    for i, vid in enumerate(ids, 1):
+        if bh.expired():
+            _cp(serial, f"stopped: out of time after {len(watched)}/{len(ids)}")
+            break
+        # Force-stop between videos: with the app already foregrounded on
+        # another watch page, a second VIEW intent may be swallowed by the
+        # existing task instead of switching videos — which would silently
+        # re-watch video N while reporting N+1.
+        await adb.force_stop(serial, PKG)
+        await bh.pause(0.6, 1.4)
+        # -p, NOT -n: the UrlActivity class name is an internal detail Google
+        # has renamed across app versions, and pinning it would break every
+        # device at once on an update. -p constrains resolution to YouTube while
+        # letting the app declare its own handler.
+        url = f"https://www.youtube.com/watch?v={vid}"
+        await adb.shell(serial, f"am start -a android.intent.action.VIEW -d '{url}' -p {PKG}")
+
+        on = await _await_online(serial, ctrl, bh, timeout=25)
+        if not on["ok"]:
+            watched.append({"n": i, "id": vid, "ok": False, "reason": on.get("reason")})
+            continue
+        # Ads run before the video; playback of the AD also reports state=3, so
+        # this waits for "something is playing", then _watch_video's own dwell
+        # covers the ad and the content alike.
+        playing = await _await_playback(serial, bh, timeout=35)
+        if not playing:
+            _log(serial, f"{vid}: never started playing")
+            watched.append({"n": i, "id": vid, "ok": False,
+                            "reason": "opened but never started playing"})
+            _cp(serial, f"video {i}/{len(ids)} NO PLAYBACK")
+            continue
+
+        res = await _watch_video(serial, ctrl, bh, _watch_s_pick(ws))
+        secs = float(res.get("watched_s") or 0)
+        still = await _is_playing(serial)
+        watched.append({"n": i, "id": vid, "ok": secs > 0, "watched_s": secs,
+                        "playing_at_end": still})
+        _cp(serial, f"video {i}/{len(ids)} watched {secs:g}s")
+        _log(serial, f"{i}/{len(ids)} {vid}: {secs:g}s")
+
+    await _close_app(serial, ctrl, bh)
+    played = [w for w in watched if w.get("ok")]
+    total = round(sum(float(w.get("watched_s") or 0) for w in played), 1)
+    out = {"ok": bool(played), "flow": "watch_ids",
+           "videos_ok": len(played), "attempted": len(watched), "planned": len(ids),
+           "total_watched_s": total, "checkpoints": _cp_trail(serial), "detail": watched}
+    if not played:
+        first = watched[0].get("reason") if watched else "nothing attempted"
+        out["reason"] = f"0 of {len(ids)} videos played — first failure: {first}"
+    _log(serial, f"watch_ids done: {len(played)}/{len(ids)} played, {total}s")
+    return out
+
+
 async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     _cp_reset(serial)
     _log(serial, "shorts start")
@@ -1790,7 +1899,7 @@ async def onboard(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
 
 _FLOWS = {"watch_link": watch_link, "search_watch": search_watch,
           "channel_watch": channel_watch, "channel_binge": channel_binge,
-          "channel_all": channel_all,
+          "channel_all": channel_all, "watch_ids": watch_ids,
           "shorts": shorts, "session": session, "onboard": onboard}
 
 
