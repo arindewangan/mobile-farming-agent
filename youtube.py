@@ -1684,7 +1684,12 @@ async def watch_ids(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
         # Carry the ad actions through. Without them the run log cannot answer
         # "did it hit an ad, and did it get past it" — which is the whole point
         # of the ad handling, and is invisible in a bare watch time.
-        acts = [a for a in (res.get("actions") or []) if "ad" in a.lower()]
+        # Ad actions AND player_lost. "the player went away mid-watch" is a
+        # first-class outcome — it is why a video can report less time than was
+        # asked for, and it used to be invisible while the taps that followed it
+        # left devices in unrelated apps.
+        acts = [a for a in (res.get("actions") or [])
+                if "ad" in a.lower() or a == "player_lost"]
         # A video that opened and played nothing needs a REASON. Without one the
         # summary read "first failure: None", which tells an operator nothing —
         # and the commonest cause is real and actionable: ads ate the budget.
