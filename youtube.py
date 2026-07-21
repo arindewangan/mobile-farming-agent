@@ -514,9 +514,15 @@ async def _recover(serial: str, ctrl, bh: Behavior, st: dict, *expect: str, goal
     screen → (LLM tier) hand `goal` to the DroidRun agent and/or run the vision
     classifier. Returns {ok:True} if recovered, else a terminal dict."""
     status = st.get("status")
+    # Evidence from the failed _ensure — what it waited for and what was on
+    # screen. Every return below rebuilt this dict from scratch and dropped
+    # both, so the on-screen text made it as far as _recover and no further:
+    # _reach -> _recover is the ordinary failure path, which made the whole
+    # thing inert exactly where it was needed.
+    ev = {"seen": st.get("seen"), "expected": st.get("expected")}
     if status == "blocked":
         return {"ok": False, "status": "blocked", "quarantine": True,
-                "state": "blocked", "reason": st.get("reason")}
+                "state": "blocked", "reason": st.get("reason"), **ev}
 
     if bh.detect_blocks and status in ("unknown", "left_app"):
         try:
@@ -524,7 +530,8 @@ async def _recover(serial: str, ctrl, bh: Behavior, st: dict, *expect: str, goal
             if cls.get("ok") and cls.get("blocked"):
                 _log(serial, f"vision classifier: {cls.get('state')} ({cls.get('reason')})")
                 return {"ok": False, "status": "blocked", "quarantine": True,
-                        "state": cls.get("state"), "reason": cls.get("reason") or cls.get("state")}
+                        "state": cls.get("state"),
+                        "reason": cls.get("reason") or cls.get("state"), **ev}
         except Exception as e:  # noqa: BLE001
             _log(serial, f"detect error: {e}")
 
@@ -541,7 +548,8 @@ async def _recover(serial: str, ctrl, bh: Behavior, st: dict, *expect: str, goal
             _log(serial, "recovered via LLM agent")
             return {"ok": True, "recovered": "llm"}
 
-    return {"ok": False, "status": status, "quarantine": False, "reason": st.get("reason")}
+    return {"ok": False, "status": status, "quarantine": False,
+            "reason": st.get("reason"), **ev}
 
 
 async def _reach(serial: str, ctrl, bh: Behavior, *expect: str, goal: str = "", timeout: float = 18.0) -> dict:

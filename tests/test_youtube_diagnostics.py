@@ -109,3 +109,44 @@ class TestAbortExplainsItself:
         out = youtube._abort("f", {"seen": ["", "  ", "real"], "expected": [""]})
         assert "on screen: real" in out["detail"]
         assert "waiting for" not in out["detail"]
+
+
+class TestEvidenceSurvivesRecovery:
+    """_reach -> _recover is the ORDINARY failure path.
+
+    _recover rebuilt its return dict from scratch, so the on-screen text and the
+    expected markers reached it and went no further — which made the evidence
+    above inert in exactly the case it was written for. Caught by running a real
+    session and noticing the "on screen:" clause was missing from a live
+    failure, not by reading the code.
+    """
+
+    async def _recover_via(self, monkeypatch, status="unknown", **bh_kw):
+        class _BH:
+            detect_blocks = bh_kw.get("detect_blocks", False)
+            llm_fallback = bh_kw.get("llm_fallback", False)
+        st = {"ok": False, "status": status, "reason": "unexpected screen",
+              "seen": ["Sign in to continue"], "expected": ["watch_markers"]}
+        return await youtube._recover("S1", None, _BH(), st, "watch_markers")
+
+    def test_the_unknown_screen_path_keeps_the_evidence(self):
+        import asyncio
+        out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            self._recover_via(None))
+        assert out["seen"] == ["Sign in to continue"]
+        assert out["expected"] == ["watch_markers"]
+
+    def test_the_blocked_path_keeps_it_too(self):
+        import asyncio
+        out = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            self._recover_via(None, status="blocked"))
+        assert out["seen"] == ["Sign in to continue"]
+
+    def test_end_to_end_the_text_lands_in_the_operator_message(self):
+        """The property that actually matters: a failure that went through
+        recovery still tells the operator what was on the screen."""
+        import asyncio
+        rec = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            self._recover_via(None))
+        out = youtube._abort("channel_watch", rec)
+        assert "on screen: Sign in to continue" in out["detail"]
