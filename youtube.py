@@ -280,24 +280,106 @@ async def _foreground_pkg(serial: str) -> str:
     return m.group(1) if m else ""
 
 
+# ── Ads ──────────────────────────────────────────────────────────────────────
+# Two signals, two jobs: `ad_markers` (id/ad_progress_text) answers "is an ad on
+# screen", `skip` (id/skip_ad_button) answers "can I skip it yet". Detect on the
+# first, act on the second — conflating them is what made the old code skip
+# blindly and then measure the ad as watch time.
+#
+# Resource-ids, not text. YouTube removed the countdown from the skip button on
+# mobile in October 2024, so every harness keying on "Skip Ad (5)" silently
+# broke; ids are also the only thing that works in a non-English locale.
+_SKIP_POLL_S = 0.5          # the skippable window is ~5s — sub-second polling
+_SKIP_WAIT_S = 8.0          # no skip control by now ⇒ treat the ad as unskippable
+_AD_WAIT_S = 45.0           # bumpers are 6s, non-skippable pre-rolls 15–30s
+_AD_CLEAR_POLLS = 2         # consecutive clear polls before believing it is over
+_AD_POD_MAX = 4             # ads back-to-back before giving up on this video
+_SKIP_DEBOUNCE_S = 3.0      # a second tap lands on the video and pauses it
+
+
+async def _ad_present(serial: str, bh: "Behavior") -> bool:
+    m = await _ui(serial, *bh.sel("ad_markers"))
+    return any(v.get("present") for v in m.values())
+
+
 async def _skip_ad(serial: str, ctrl, bh: "Behavior") -> bool:
-    """Tap the ad-skip button the moment it's tappable — via the a11y tree, then OCR
-    (the skip button is often a graphic the tree doesn't expose)."""
+    """Tap the skip control if it is present AND actually tappable.
+
+    "Present" is not "tappable": the control exists in the tree before it is
+    live, and tapping it then does nothing while the caller believes the ad was
+    skipped. So `enabled`/`clickable` are checked, and the tap only happens when
+    both hold.
+    """
     skip = bh.sel("skip")
     matches = await _ui(serial, *skip)
     for q in skip:
         m = matches.get(q)
-        if m and m.get("present") and m.get("x") is not None:
-            await _click(serial, m["x"], m["y"])
-            await asyncio.sleep(random.uniform(0.3, 0.8))
-            return True
-    reg = bh.geo("skip_region", [0.5, 0.45, 1.0, 0.95])
-    hit = await vision.ocr_find(serial, "Skip", region=vision.region(*reg))
-    if hit:
-        await _click(serial, hit["x"], hit["y"])
+        if not (m and m.get("present") and m.get("x") is not None):
+            continue
+        if str(m.get("enabled", "true")).lower() == "false":
+            continue                       # rendered but not yet live
+        await _click(serial, m["x"], m["y"])
         await asyncio.sleep(random.uniform(0.3, 0.8))
         return True
     return False
+
+
+async def _clear_ads(serial: str, ctrl, bh: "Behavior") -> dict:
+    """Get past whatever ads are in front of the video. Returns what happened.
+
+    Handles the three cases that broke the old single-shot skip:
+      • the skip control is not live for ~5s, so one early attempt always missed;
+      • some ads cannot be skipped at all, so polling for a button that will
+        never appear just burns the watch budget — wait for the AD to end instead;
+      • ads come in pods, so one skip is not "ads are done".
+
+    A clear result needs _AD_CLEAR_POLLS consecutive ad-free reads: right after a
+    skip there is a frame where neither the ad nor the player chrome is up, and
+    believing that single read is how the second ad of a pod got measured as
+    content.
+    """
+    t0 = _now()
+    skipped = waited = pods = 0
+    clear = 0
+    last_tap = 0.0
+
+    while _now() - t0 < _AD_WAIT_S * 2:
+        if not await _ad_present(serial, bh):
+            clear += 1
+            if clear >= _AD_CLEAR_POLLS:
+                break
+            await asyncio.sleep(_SKIP_POLL_S)
+            continue
+        clear = 0
+        pods += 1
+        if pods > _AD_POD_MAX:
+            _log(serial, f"ad pod still running after {pods} ads — giving up on this video")
+            return {"ok": False, "skipped": skipped, "waited": waited, "reason": "ad pod too long"}
+
+        # Poll for the skip control through its disabled window.
+        deadline = _now() + _SKIP_WAIT_S
+        did = False
+        while _now() < deadline:
+            if _now() - last_tap >= _SKIP_DEBOUNCE_S and await _skip_ad(serial, ctrl, bh):
+                last_tap = _now()
+                skipped += 1
+                did = True
+                break
+            if not await _ad_present(serial, bh):
+                break                      # ad ended on its own while we waited
+            await asyncio.sleep(_SKIP_POLL_S)
+        if did:
+            await asyncio.sleep(random.uniform(0.8, 1.6))   # let the switch settle
+            continue
+
+        # No skip control appeared — unskippable. Wait for the AD to end, which
+        # is a signal that exists, rather than for a button that does not.
+        waited += 1
+        end = _now() + _AD_WAIT_S
+        while _now() < end and await _ad_present(serial, bh):
+            await asyncio.sleep(_SKIP_POLL_S * 2)
+
+    return {"ok": True, "skipped": skipped, "waited": waited, "ads": pods}
 
 
 # ------------------------------------------------ player controls (rich) -----
@@ -778,14 +860,21 @@ async def _watch_video(serial: str, ctrl, bh: Behavior, watch_s: float, *, allow
     t_sub = t_like + bh.wp("subscribe_slot")
     t_peek = t_sub + bh.wp("peek_description")
 
-    start = _now()
     did = {"like": False, "subscribe": False, "comments": False, "peek": False}
     actions: list[str] = []
     last_orient = _now()
 
     await bh.pause(*(bh.wr("initial_settle_s") or [1.5, 4.0]))
-    if await _skip_ad(serial, ctrl, bh):
-        actions.append("skip_ad")
+    # Clear pre-roll ads BEFORE the clock starts. `start` used to be stamped
+    # above this, so a 25s "watch" could be 15s of ad and 10s of video — the
+    # reported watch time was not watch time. Anything before this point is ad,
+    # and is not the caller's content.
+    ads = await _clear_ads(serial, ctrl, bh)
+    if ads.get("skipped"):
+        actions.append(f"skip_ad×{ads['skipped']}")
+    if ads.get("waited"):
+        actions.append(f"unskippable_ad×{ads['waited']}")
+    start = _now()
 
     seg = bh.wr("segment_s") or [3.5, 11.0]
     while _now() - start < target and not bh.expired():
@@ -798,8 +887,17 @@ async def _watch_video(serial: str, ctrl, bh: Behavior, watch_s: float, *, allow
             await adb.set_orientation(serial, bh.orientation)
             last_orient = _now()
 
-        if bh.roll(bh.wp("skip_ad_recheck")) and await _skip_ad(serial, ctrl, bh):
-            actions.append("skip_ad")
+        # Mid-roll ads re-enter the same pod-aware path. Time spent in here is
+        # ad time, so the target is extended by it — otherwise a mid-roll eats
+        # the content watch the caller asked for.
+        if bh.roll(bh.wp("skip_ad_recheck")) and await _ad_present(serial, bh):
+            t_ad = _now()
+            mid = await _clear_ads(serial, ctrl, bh)
+            target += _now() - t_ad
+            if mid.get("skipped"):
+                actions.append(f"midroll_skip×{mid['skipped']}")
+            if mid.get("waited"):
+                actions.append(f"midroll_wait×{mid['waited']}")
             continue
 
         roll = random.random()
@@ -1489,7 +1587,10 @@ async def _is_playing(serial: str) -> bool:
         out = r.get("stdout", "") or ""
     except Exception:  # noqa: BLE001
         return False
-    return "state=3" in out.replace(" ", "")
+    flat = out.replace(" ", "")
+    # 3 = PLAYING, 6 = BUFFERING. Treating a buffer stall as "not playing"
+    # would fail a video that is merely loading on a slow proxy.
+    return "state=3" in flat or "state=6" in flat
 
 
 async def _await_playback(serial: str, bh: Behavior, timeout: float = 35.0) -> bool:

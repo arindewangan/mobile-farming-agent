@@ -70,7 +70,13 @@ DEFAULT_PROFILE: dict = {
             "Keep watching", "Accept all", "I agree", "Allow", "OK", "Continue",
         ],
         # ad-skip button text/desc — tapped the instant it becomes tappable
-        "skip": ["Skip Ads", "Skip Ad", "Skip ad", "Skip ads", "SKIP AD", "Skip"],
+        "skip": ["id/skip_ad_button",
+                 # Text LAST and only as a fallback: YouTube removed the
+                 # countdown from the skip button on mobile in Oct 2024, so
+                 # text matching silently stopped working — and it never
+                 # worked in a non-English locale. The resource-id is
+                 # language-proof and is what real ad-skippers target.
+                 "Skip Ads", "Skip Ad", "Skip ad", "Skip ads", "SKIP AD"],
         # hard blockers we CANNOT pass → abort with this reason so a human steps in.
         # [query-substring, human-reason]. Keep specific to avoid false positives.
         "blockers": [
@@ -108,7 +114,8 @@ DEFAULT_PROFILE: dict = {
         # the focused search text field
         "search_edit": ["id/search_edit_text", "Search YouTube", "id/search"],
         # things that mark a result cell as an AD (skip it when picking)
-        "ad_markers": ["Sponsored", "Install", "Ad ·", "Ad·", "Get app"],
+        "ad_markers": ["id/ad_progress_text",
+                       "Sponsored", "Install", "Ad ·", "Ad·", "Get app"],
         # a11y probes whose presence means "a real video cell" (its centre opens it)
         "cell_probes": [" views", " watching", " ago"],
         # OCR tokens that mark an organic result (read off pixels if the tree misses)
