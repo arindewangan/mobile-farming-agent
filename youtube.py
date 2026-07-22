@@ -1730,6 +1730,80 @@ async def watch_ids(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     return out
 
 
+async def watch_short_ids(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
+    """Watch an explicit list of SHORT ids, in order.
+
+    The Shorts sibling of watch_ids, and it exists for the same reason: the
+    channel Shorts GRID has no provenance in its accessibility tree either, so
+    scrolling-and-tapping it can drift into the recommended-shorts feed and
+    count another creator's short as this channel's. Deep-linking each short id
+    (/shorts/<id>) removes that — the reel opens on exactly the short asked for.
+
+    A Short is short, so this deep-links each one rather than swiping the reel
+    feed: swiping is where the feed drifts to recommendations. `_watch_video`'s
+    tap/seek engagement is skipped (`engage=""`) because the reel player is a
+    different surface — its like button and progress bar are elsewhere — and a
+    fixed-coordinate tap there is exactly what put a device in the Clock app.
+    """
+    _cp_reset(serial)
+    raw = p.get("short_ids") or p.get("video_ids") or []
+    if isinstance(raw, str):
+        raw = [v.strip() for v in raw.split(",") if v.strip()]
+    ids = [str(v).strip() for v in raw if str(v).strip()]
+    if not ids:
+        return _abort("watch_short_ids", {"status": "unknown", "reason":
+                      "no short_ids given — the control plane enumerates the channel's Shorts"})
+    ws = p.get("watch_s", 20)
+    _log(serial, f"watch_short_ids: {len(ids)} short(s)")
+
+    await _set_orientation(serial, bh.orientation)
+    watched: list[dict] = []
+
+    for i, sid in enumerate(ids, 1):
+        if bh.expired():
+            _cp(serial, f"stopped: out of time after {len(watched)}/{len(ids)}")
+            break
+        await adb.force_stop(serial, PKG)
+        await bh.pause(0.6, 1.4)
+        # The reel player is portrait-locked by the app, which sidesteps the
+        # tilt-to-landscape flip the grid path suffers. -p, not -n, for the same
+        # version-proofing reason as watch_ids.
+        url = f"https://www.youtube.com/shorts/{quote(sid, safe='')}"
+        await adb.shell(serial, f"am start -a android.intent.action.VIEW -d '{url}' -p {PKG}")
+        await _force_portrait(serial, bh)
+
+        on = await _await_online(serial, ctrl, bh, timeout=25)
+        if not on["ok"]:
+            watched.append({"n": i, "id": sid, "ok": False, "reason": on.get("reason")})
+            continue
+        if not await _await_playback(serial, bh, timeout=30):
+            _log(serial, f"{sid}: never started playing")
+            watched.append({"n": i, "id": sid, "ok": False, "reason": "opened but never started playing"})
+            _cp(serial, f"short {i}/{len(ids)} NO PLAYBACK")
+            continue
+
+        # A Short loops, so "watch it" is a dwell, not a play-to-end. No engage
+        # taps: the reel surface's controls are not where the watch player's are.
+        res = await _watch_video(serial, ctrl, bh, _watch_s_pick(ws), allow_boredom=False)
+        secs = float(res.get("watched_s") or 0)
+        watched.append({"n": i, "id": sid, "ok": secs > 0, "watched_s": secs})
+        _cp(serial, f"short {i}/{len(ids)} watched {secs:g}s")
+        _log(serial, f"{i}/{len(ids)} {sid}: {secs:g}s")
+
+    await _close_app(serial, ctrl, bh)
+    played = [w for w in watched if w.get("ok")]
+    total = round(sum(float(w.get("watched_s") or 0) for w in played), 1)
+    out = {"ok": bool(played), "flow": "watch_short_ids",
+           "shorts_ok": len(played), "attempted": len(watched), "planned": len(ids),
+           "videos_ok": len(played), "total_watched_s": total,
+           "checkpoints": _cp_trail(serial), "detail": watched}
+    if not played:
+        first = watched[0].get("reason") if watched else "nothing attempted"
+        out["reason"] = f"0 of {len(ids)} shorts played — first failure: {first}"
+    _log(serial, f"watch_short_ids done: {len(played)}/{len(ids)} played, {total}s")
+    return out
+
+
 async def shorts(serial: str, ctrl, p: dict, bh: Behavior) -> dict:
     _cp_reset(serial)
     _log(serial, "shorts start")
@@ -2055,6 +2129,7 @@ _HARD_CAP_MARGIN_S = 90.0
 _FLOWS = {"watch_link": watch_link, "search_watch": search_watch,
           "channel_watch": channel_watch, "channel_binge": channel_binge,
           "channel_all": channel_all, "watch_ids": watch_ids,
+          "watch_short_ids": watch_short_ids,
           "shorts": shorts, "session": session, "onboard": onboard}
 
 
